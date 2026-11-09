@@ -144,3 +144,49 @@ def test_scenario_mode_attaches_to_an_existing_ego():
         node.destroy_node()
         rclpy.shutdown()
         ego.destroy()
+
+
+def test_scenario_mode_uses_the_native_interface_for_a_native_ego():
+    """As with ego.native_autoware_interface: 'ego' spawned with ros2_autoware_control."""
+    import rclpy
+    from rclpy.parameter import Parameter
+
+    from autoware_carla_interface_v2.carla_client import carla
+    from autoware_carla_interface_v2.node import CarlaAutowareNode
+
+    client = carla.Client(HOST, PORT)
+    client.set_timeout(60.0)
+    world = client.get_world()
+    blueprint = world.get_blueprint_library().find("vehicle.lincoln.mkz")
+    if not blueprint.has_attribute("ros2_autoware_control"):
+        pytest.skip("the server has no native Autoware interface (start it with -ros2)")
+    blueprint.set_attribute("role_name", "ego")
+    blueprint.set_attribute("ros2_autoware_control", "true")
+    points = list(world.get_map().get_spawn_points())
+    ego = next(
+        actor
+        for actor in (world.try_spawn_actor(blueprint, p) for p in points)
+        if actor is not None
+    )
+    rclpy.init()
+    node = CarlaAutowareNode(
+        parameter_overrides=[
+            Parameter("host", value=HOST),
+            Parameter("port", value=PORT),
+            Parameter("timeout", value=60.0),
+            Parameter("scenario_mode", value=True),
+            Parameter("no_rendering_mode", value=True),
+        ]
+    )
+    try:
+        node.start()
+        assert node._ego.id == ego.id
+        assert node._vehicle_interface is None  # CARLA serves control and status
+        types = {a.type_id for a in world.get_actors([a.id for a in node._spawned])}
+        assert "sensor.other.vehicle_status" in types
+        node.shutdown()
+        assert world.get_actor(ego.id) is not None
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+        ego.destroy()

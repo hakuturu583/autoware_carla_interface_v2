@@ -70,6 +70,9 @@ from .transforms import quaternion_to_rpy
 from .vehicle_interface import ClientSideVehicleInterface
 
 EGO_ROLE_NAMES = ("ego", "hero")
+# autoware_carla_scenario's ego: "Ego", or "ego" when it is spawned for CARLA's
+# native Autoware interface (ego.native_autoware_interface).
+SCENARIO_EGO_ROLE_NAMES = ("Ego",) + EGO_ROLE_NAMES
 
 
 def to_carla_transform(pose: Pose):
@@ -192,6 +195,18 @@ class CarlaAutowareNode(Node):
             return role
         return "Ego" if self.param("scenario_mode") else "ego"
 
+    def ego_role_names(self):
+        """The role names that identify the scenario's ego in scenario_mode.
+
+        autoware_carla_scenario spawns its ego as ``Ego``, or as ``ego`` when
+        its ``native_autoware_interface`` registers the ego with CARLA's native
+        Autoware interface (which serves only ``ego`` and ``hero``). Like the
+        framework's own ``canonical_role_name``, any of them is the ego unless
+        ``ego_role_name`` names one.
+        """
+        role = self.param("ego_role_name").strip()
+        return (role,) if role else SCENARIO_EGO_ROLE_NAMES
+
     def start(self):
         """Connect, prepare the world and the ego, and start ticking.
 
@@ -220,17 +235,17 @@ class CarlaAutowareNode(Node):
 
     def _attach_ego(self):
         """Wait for the vehicle with our role name (spawned by the scenario)."""
-        role = self.role_name()
+        roles = self.ego_role_names()
         deadline = time.monotonic() + float(self.param("ego_wait_timeout"))
-        self.get_logger().info(f"scenario_mode: waiting for the ego (role_name '{role}')")
+        self.get_logger().info(f"scenario_mode: waiting for the ego (role_name in {roles})")
         while True:
             for actor in self._world.get_actors().filter("vehicle.*"):
-                if actor.attributes.get("role_name") == role:
+                if actor.attributes.get("role_name") in roles:
                     self._ego = as_vehicle(actor)
                     self.get_logger().info(f"Attached to ego {actor.type_id} (id {actor.id})")
                     return
             if time.monotonic() >= deadline:
-                raise RuntimeError(f"No vehicle with role_name '{role}' appeared")
+                raise RuntimeError(f"No vehicle with role_name in {roles} appeared")
             time.sleep(0.5)
 
     def _uses_native_vehicle_interface(self):

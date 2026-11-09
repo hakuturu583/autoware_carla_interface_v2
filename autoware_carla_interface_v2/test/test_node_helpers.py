@@ -97,3 +97,28 @@ def test_role_name_defaults_follow_the_mode(scenario_mode, role, expected):
         node.destroy_node()
     finally:
         rclpy.shutdown()
+
+
+@pytest.mark.parametrize(
+    "role, expected",
+    [("", ("Ego", "ego", "hero")), ("Ego", ("Ego",))],
+)
+def test_scenario_ego_is_found_under_either_role_name(role, expected):
+    """autoware_carla_scenario's ego is 'Ego', or 'ego' with native_autoware_interface."""
+    import rclpy
+    from rclpy.parameter import Parameter
+
+    from autoware_carla_interface_v2.node import CarlaAutowareNode
+
+    rclpy.init()
+    try:
+        node = CarlaAutowareNode(
+            parameter_overrides=[
+                Parameter("scenario_mode", value=True),
+                Parameter("ego_role_name", value=role),
+            ]
+        )
+        assert node.ego_role_names() == expected
+        node.destroy_node()
+    finally:
+        rclpy.shutdown()

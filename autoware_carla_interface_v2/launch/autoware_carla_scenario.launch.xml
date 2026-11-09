@@ -19,7 +19,7 @@
   <arg name="rviz" default="false" description="Scenario runs are usually headless"/>
   <arg name="host" default="localhost"/>
   <arg name="port" default="2000"/>
-  <arg name="ego_role_name" default="Ego" description="autoware_carla_scenario's ego role name"/>
+  <arg name="ego_role_name" default="" description="Empty: the scenario's ego, Ego or (ego.native_autoware_interface) ego"/>
   <arg name="ego_wait_timeout" default="60.0"/>
   <arg name="vehicle_interface" default="auto"/>
   <arg name="no_rendering_mode" default="false" description="Leave cameras out (a -nullrhi server crashes on them)"/>

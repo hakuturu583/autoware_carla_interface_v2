@@ -118,16 +118,19 @@ uv run scenario ego.entity=autoware autoware.launcher.type=command \
   'autoware.launcher.command=[bash,-c,"source ~/autoware/install/setup.bash && ({scenario_bridge} &) && exec ros2 launch autoware_carla_interface_v2 autoware_carla_scenario.launch.xml map_path:=$HOME/autoware_data/maps/Town10HD_Opt"]'
 ```
 
-In `scenario_mode` the node waits up to `ego_wait_timeout` for the scenario's ego (role name
-`Ego`), spawns the sensor kit on it and does nothing else to the session: it loads no level,
+In `scenario_mode` the node waits up to `ego_wait_timeout` for the ego the scenario spawned
+(role name `Ego`, or `ego` with `ego.native_autoware_interface`), spawns the sensor kit on it and does nothing else to the session: it loads no level,
 changes no settings, never ticks, and ignores `/initialpose` (the scenario places the ego). On
 shutdown, when the launcher stops the stack at the end of the scenario, it removes only its
 sensors.
 
 CARLA serves Autoware's vehicle interface natively only for a vehicle spawned with
-`ros2_autoware_control` and the role name `ego` or `hero`, which the scenario's `Ego` is not. For
-such an ego the node provides the interface from the client (`vehicle_interface:=auto`, the
-default, decides from the ego's attributes):
+`ros2_autoware_control` and the role name `ego` or `hero`. Run the scenario with
+`ego.native_autoware_interface=true` (autoware_carla_scenario 26.6.0 and later) and it spawns its
+ego that way: the server then applies Autoware's control and publishes the vehicle status, and
+the node spawns the `sensor.other.vehicle_status` sensor on the ego. Without it the ego is `Ego`,
+which CARLA does not serve, and the node provides the interface from the client
+(`vehicle_interface:=auto`, the default, decides from the ego's attributes):
 
 - `/control/command/control_cmd` is applied as CARLA Ackermann control: the server turns the
   target speed, acceleration and steering tire angle into pedals and steering, so no actuation
@@ -137,7 +140,7 @@ default, decides from the ego's attributes):
 
 `autoware_carla_scenario.launch.xml` arguments: `map_path` (required), `vehicle_model`
 (`sample_vehicle`), `sensor_model` (`awsim_sensor_kit`, matching the default sensor kit),
-`sensor_kit_file`, `data_path`, `rviz` (`false`), `host`, `port`, `ego_role_name` (`Ego`),
+`sensor_kit_file`, `data_path`, `rviz` (`false`), `host`, `port`, `ego_role_name` (empty: `Ego`, `ego` or `hero`),
 `ego_wait_timeout`, `vehicle_interface`, `no_rendering_mode`, `traffic_light.publish` (`true`,
 matched against `map_path/lanelet2_map.osm`), `map_origin_x`, `map_origin_y`.
 
@@ -155,7 +158,7 @@ matched against `map_path/lanelet2_map.osm`), `map_origin_x`, `map_origin_y`.
 | `publish_tf`                                                | `false`                                                          | Let CARLA publish `/tf`. Off because Autoware publishes the vehicle's tree from its URDF.                                               |
 | `scenario_mode`                                             | `false`                                                          | Attach to autoware_carla_scenario's ego, level and clock instead of providing them (see above).                                         |
 | `ego_wait_timeout`                                          | `60.0`                                                           | `scenario_mode`: how long to wait for the ego [s].                                                                                      |
-| `ego_role_name`                                             | `""`                                                             | Empty: `Ego` in `scenario_mode`, `ego` otherwise. CARLA's native interface only serves `ego` and `hero`.                               |
+| `ego_role_name`                                             | `""`                                                             | Empty: in `scenario_mode` any of `Ego`, `ego`, `hero`; otherwise `ego`. CARLA's native interface only serves `ego` and `hero`.          |
 | `vehicle_interface`                                         | `auto`                                                           | `native`: CARLA applies control and publishes the status; `client`: this node does; `auto`: native when the ego is registered for it. |
 | `vehicle_blueprint`                                         | `""`                                                             | Ego blueprint; empty uses the sensor kit file's (`vehicle.lincoln.mkz`, the vehicle CARLA tuned steering for).                         |
 | `spawn_point`                                               | `""`                                                             | `x,y,z,roll,pitch,yaw` in CARLA coordinates (m, deg). Empty uses `spawn_index`.                                                        |
