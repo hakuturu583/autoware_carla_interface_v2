@@ -4,6 +4,7 @@
   <arg name="ego_wait_timeout" default="60.0" description="scenario_mode: how long to wait for the scenario's ego [s]"/>
   <arg name="vehicle_interface" default="auto" description="auto | native | client: who applies control_cmd and publishes /vehicle/status/*"/>
   <!-- CARLA server -->
+  <arg name="use_sim_time" default="false" description="Stamp what this node publishes with CARLA's /clock"/>
   <arg name="host" default="localhost"/>
   <arg name="port" default="2000"/>
   <arg name="timeout" default="20.0"/>
@@ -39,6 +40,7 @@
   />
 
   <node pkg="autoware_carla_interface_v2" exec="autoware_carla_interface_v2" name="autoware_carla_interface_v2" output="screen">
+    <param name="use_sim_time" value="$(var use_sim_time)"/>
     <param name="host" value="$(var host)"/>
     <param name="port" value="$(var port)"/>
     <param name="timeout" value="$(var timeout)"/>

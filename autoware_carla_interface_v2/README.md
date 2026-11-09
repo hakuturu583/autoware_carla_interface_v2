@@ -90,18 +90,39 @@ the ego.
 ## With autoware_carla_scenario
 
 [autoware_carla_scenario](https://github.com/autowarefoundation/autoware_carla_scenario) runs the
-session itself: it loads the level, spawns the ego (role name `Ego`) at the scenario's start pose
-and owns the clock. Start the node with `scenario_mode:=true` beside Autoware and the framework's
-`scenario_bridge` node:
+session, and its Autoware launcher starts and kicks Autoware for every scenario: once the
+scenario's ego exists, the launcher runs one `ros2 launch` plus the framework's `scenario_bridge`
+node, which initializes localization, sets the route and engages through the AD API. Nothing in
+this package initializes or kicks Autoware.
+
+`launch/autoware_carla_scenario.launch.xml` is that one launch: Autoware (`autoware_launch`'s
+`e2e_simulator.launch.xml` with `simulator_type:=carla` and `launch_simulator_interface:=false`,
+so Universe's interface is not started) plus this node in `scenario_mode`. Point the launcher at
+it:
 
 ```bash
-ros2 launch autoware_carla_interface_v2 autoware_carla_interface_v2.launch.xml scenario_mode:=true
+uv run scenario 'scenario=intersection_passing/*' map=town10hd_opt \
+  ego.entity=autoware \
+  autoware.launcher.type=docker \
+  autoware.launcher.workspace=$HOME/autoware \
+  'autoware.launcher.launch=[autoware_carla_interface_v2,autoware_carla_scenario.launch.xml,"map_path:=/home/aw/autoware_map/Town10HD_Opt"]'
 ```
 
-In that mode the node waits up to `ego_wait_timeout` for the scenario's ego, spawns the sensor
-kit on it and does nothing else to the session: it loads no level, changes no settings, never
-ticks, and ignores `/initialpose` (the scenario places the ego; a teleport would fight it). On
-shutdown it removes only its sensors.
+The workspace (a clone of `autowarefoundation/autoware`) needs this package in `src/`. The docker
+launcher refuses a workspace whose launch has no `scenario_mode`; it currently looks only at
+`autoware_carla_interface`'s launch file, so it needs the change that also accepts the configured
+launch file (this one declares `scenario_mode`). The `command` launcher works without it:
+
+```bash
+uv run scenario ego.entity=autoware autoware.launcher.type=command \
+  'autoware.launcher.command=[bash,-c,"source ~/autoware/install/setup.bash && ({scenario_bridge} &) && exec ros2 launch autoware_carla_interface_v2 autoware_carla_scenario.launch.xml map_path:=$HOME/autoware_data/maps/Town10HD_Opt"]'
+```
+
+In `scenario_mode` the node waits up to `ego_wait_timeout` for the scenario's ego (role name
+`Ego`), spawns the sensor kit on it and does nothing else to the session: it loads no level,
+changes no settings, never ticks, and ignores `/initialpose` (the scenario places the ego). On
+shutdown, when the launcher stops the stack at the end of the scenario, it removes only its
+sensors.
 
 CARLA serves Autoware's vehicle interface natively only for a vehicle spawned with
 `ros2_autoware_control` and the role name `ego` or `hero`, which the scenario's `Ego` is not. For
@@ -114,9 +135,11 @@ default, decides from the ego's attributes):
 - `/vehicle/status/{velocity,steering,gear,control_mode,turn_indicators,hazard_lights}_status`
   are published on every simulation frame (`World.on_tick`), stamped with the frame's time.
 
-autoware_carla_scenario's `docker` launcher looks for the Universe package name
-`autoware_carla_interface`; with its `command` or `none` launcher, start this package's launch
-file as above.
+`autoware_carla_scenario.launch.xml` arguments: `map_path` (required), `vehicle_model`
+(`sample_vehicle`), `sensor_model` (`awsim_sensor_kit`, matching the default sensor kit),
+`sensor_kit_file`, `data_path`, `rviz` (`false`), `host`, `port`, `ego_role_name` (`Ego`),
+`ego_wait_timeout`, `vehicle_interface`, `no_rendering_mode`, `traffic_light.publish` (`true`,
+matched against `map_path/lanelet2_map.osm`), `map_origin_x`, `map_origin_y`.
 
 ## Parameters
 

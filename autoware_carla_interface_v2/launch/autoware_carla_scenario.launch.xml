@@ -1,0 +1,59 @@
+<launch>
+  <!--
+    Autoware + this node, as autoware_carla_scenario's Autoware launcher starts them
+    for every scenario:
+
+      autoware.launcher.launch=[autoware_carla_interface_v2,autoware_carla_scenario.launch.xml,"map_path:=..."]
+
+    The scenario framework owns the session: it loads the level, spawns the ego,
+    ticks the world, and its scenario_bridge node (started beside this launch by
+    the launcher) initializes localization, sets the route and engages through
+    the AD API. Nothing here initializes or kicks Autoware; the node only attaches
+    to the scenario's ego (scenario_mode) and spawns the sensor kit on it.
+  -->
+  <arg name="map_path" description="Autoware map directory of the scenario's level"/>
+  <arg name="vehicle_model" default="sample_vehicle"/>
+  <arg name="sensor_model" default="awsim_sensor_kit" description="Must match sensor_kit_file"/>
+  <arg name="sensor_kit_file" default="$(find-pkg-share autoware_carla_interface_v2)/config/sensor_kit.yaml"/>
+  <arg name="data_path" default="$(env HOME)/autoware_data/ml_models"/>
+  <arg name="rviz" default="false" description="Scenario runs are usually headless"/>
+  <arg name="host" default="localhost"/>
+  <arg name="port" default="2000"/>
+  <arg name="ego_role_name" default="Ego" description="autoware_carla_scenario's ego role name"/>
+  <arg name="ego_wait_timeout" default="60.0"/>
+  <arg name="vehicle_interface" default="auto"/>
+  <arg name="no_rendering_mode" default="false" description="Leave cameras out (a -nullrhi server crashes on them)"/>
+  <arg name="traffic_light.publish" default="true" description="Feed CARLA's traffic-light states to Autoware"/>
+  <arg name="map_origin_x" default="0.0"/>
+  <arg name="map_origin_y" default="0.0"/>
+  <!-- Kept so a launcher that checks for scenario support finds it; this launch is always in scenario mode. -->
+  <arg name="scenario_mode" default="true"/>
+
+  <include file="$(find-pkg-share autoware_carla_interface_v2)/launch/autoware_carla_interface_v2.launch.xml">
+    <arg name="scenario_mode" value="true"/>
+    <arg name="use_sim_time" value="true"/>
+    <arg name="host" value="$(var host)"/>
+    <arg name="port" value="$(var port)"/>
+    <arg name="ego_role_name" value="$(var ego_role_name)"/>
+    <arg name="ego_wait_timeout" value="$(var ego_wait_timeout)"/>
+    <arg name="vehicle_interface" value="$(var vehicle_interface)"/>
+    <arg name="sensor_kit_file" value="$(var sensor_kit_file)"/>
+    <arg name="no_rendering_mode" value="$(var no_rendering_mode)"/>
+    <arg name="map_origin_x" value="$(var map_origin_x)"/>
+    <arg name="map_origin_y" value="$(var map_origin_y)"/>
+    <arg name="traffic_light.publish" value="$(var traffic_light.publish)"/>
+    <arg name="traffic_light.map_path" value="$(var map_path)/lanelet2_map.osm"/>
+  </include>
+
+  <!-- Autoware, without autoware_launch's own CARLA interface -->
+  <include file="$(find-pkg-share autoware_launch)/launch/e2e_simulator.launch.xml">
+    <arg name="map_path" value="$(var map_path)"/>
+    <arg name="vehicle_model" value="$(var vehicle_model)"/>
+    <arg name="sensor_model" value="$(var sensor_model)"/>
+    <arg name="data_path" value="$(var data_path)"/>
+    <arg name="simulator_type" value="carla"/>
+    <arg name="launch_simulator_interface" value="false"/>
+    <arg name="use_sim_time" value="true"/>
+    <arg name="rviz" value="$(var rviz)"/>
+  </include>
+</launch>

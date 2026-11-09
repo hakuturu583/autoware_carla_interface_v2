@@ -11,6 +11,7 @@
 
   <exec_depend>ament_index_python</exec_depend>
   <exec_depend>autoware_control_msgs</exec_depend>
+  <exec_depend>autoware_launch</exec_depend>
   <exec_depend>autoware_perception_msgs</exec_depend>
   <exec_depend>autoware_vehicle_msgs</exec_depend>
   <exec_depend>builtin_interfaces</exec_depend>
