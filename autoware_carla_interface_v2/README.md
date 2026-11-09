@@ -87,6 +87,37 @@ sudo sysctl -w net.core.rmem_max=67108864 net.core.wmem_max=67108864
 `ros2 run autoware_carla_interface_v2 spectator_follow` keeps the CARLA spectator camera behind
 the ego.
 
+## With autoware_carla_scenario
+
+[autoware_carla_scenario](https://github.com/autowarefoundation/autoware_carla_scenario) runs the
+session itself: it loads the level, spawns the ego (role name `Ego`) at the scenario's start pose
+and owns the clock. Start the node with `scenario_mode:=true` beside Autoware and the framework's
+`scenario_bridge` node:
+
+```bash
+ros2 launch autoware_carla_interface_v2 autoware_carla_interface_v2.launch.xml scenario_mode:=true
+```
+
+In that mode the node waits up to `ego_wait_timeout` for the scenario's ego, spawns the sensor
+kit on it and does nothing else to the session: it loads no level, changes no settings, never
+ticks, and ignores `/initialpose` (the scenario places the ego; a teleport would fight it). On
+shutdown it removes only its sensors.
+
+CARLA serves Autoware's vehicle interface natively only for a vehicle spawned with
+`ros2_autoware_control` and the role name `ego` or `hero`, which the scenario's `Ego` is not. For
+such an ego the node provides the interface from the client (`vehicle_interface:=auto`, the
+default, decides from the ego's attributes):
+
+- `/control/command/control_cmd` is applied as CARLA Ackermann control: the server turns the
+  target speed, acceleration and steering tire angle into pedals and steering, so no actuation
+  maps are needed. `/control/command/gear_cmd` selects reverse and park.
+- `/vehicle/status/{velocity,steering,gear,control_mode,turn_indicators,hazard_lights}_status`
+  are published on every simulation frame (`World.on_tick`), stamped with the frame's time.
+
+autoware_carla_scenario's `docker` launcher looks for the Universe package name
+`autoware_carla_interface`; with its `command` or `none` launcher, start this package's launch
+file as above.
+
 ## Parameters
 
 | Name                                                        | Default                                                          | Description                                                                                                                             |
@@ -99,7 +130,10 @@ the ego.
 | `time_scale`, `resync`                                      | `1.0`, `true`                                                    | Simulation speed relative to wall time; jump ahead when the loop falls behind.                                                         |
 | `no_rendering_mode`                                         | `false`                                                          | Disable rendering. Cameras are then not spawned: a renderer-less (`-nullrhi`) server crashes on them.                                   |
 | `publish_tf`                                                | `false`                                                          | Let CARLA publish `/tf`. Off because Autoware publishes the vehicle's tree from its URDF.                                               |
-| `ego_role_name`                                             | `ego`                                                            | `ego` or `hero`: CARLA only drives a vehicle with one of these role names.                                                              |
+| `scenario_mode`                                             | `false`                                                          | Attach to autoware_carla_scenario's ego, level and clock instead of providing them (see above).                                         |
+| `ego_wait_timeout`                                          | `60.0`                                                           | `scenario_mode`: how long to wait for the ego [s].                                                                                      |
+| `ego_role_name`                                             | `""`                                                             | Empty: `Ego` in `scenario_mode`, `ego` otherwise. CARLA's native interface only serves `ego` and `hero`.                               |
+| `vehicle_interface`                                         | `auto`                                                           | `native`: CARLA applies control and publishes the status; `client`: this node does; `auto`: native when the ego is registered for it. |
 | `vehicle_blueprint`                                         | `""`                                                             | Ego blueprint; empty uses the sensor kit file's (`vehicle.lincoln.mkz`, the vehicle CARLA tuned steering for).                         |
 | `spawn_point`                                               | `""`                                                             | `x,y,z,roll,pitch,yaw` in CARLA coordinates (m, deg). Empty uses `spawn_index`.                                                        |
 | `spawn_index`                                               | `-1`                                                             | Index into the level's ego spawn points (or map spawn points); negative picks one at random.                                            |
@@ -158,7 +192,9 @@ CARLA_HOST=localhost python3 -m pytest test/test_carla_server.py -s
 
 It checks the server and LibCarla versions, starts the node (ego with `ros2_autoware_control`,
 vehicle status sensor, the non-camera sensors), lets it tick, and checks that shutdown removes
-everything and restores the world settings.
+everything and restores the world settings. A second test spawns an `Ego` as
+autoware_carla_scenario does and checks that `scenario_mode` attaches to it, does not tick,
+falls back to the client-side vehicle interface and leaves the ego in place on shutdown.
 
 ## typesafe_carla notes
 
@@ -171,7 +207,8 @@ as an `int`.
 
 ## Known limitations
 
-- Gear, emergency and engage commands are not applied (CARLA receives them and does nothing;
-  `control_mode` always reports `AUTONOMOUS`).
+- With CARLA's native interface, gear, emergency and engage commands are not applied (CARLA
+  receives them and does nothing; `control_mode` always reports `AUTONOMOUS`). The client-side
+  interface applies reverse and park, and also reports `AUTONOMOUS`.
 - Steering is tuned for the Lincoln MKZ (CARLA's measurement); other vehicles track more loosely.
 - Not yet run against a live CARLA 1.0 server; `test/test_carla_server.py` is that check.

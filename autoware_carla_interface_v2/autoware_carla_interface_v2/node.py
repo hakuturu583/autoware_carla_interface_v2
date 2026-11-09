@@ -32,6 +32,13 @@ data, ``/vehicle/status/*`` and ``/clock``, and applies
   traffic-signal input (optional);
 * moves the ego to an ``/initialpose`` set in RViz;
 * destroys what it spawned and restores the world settings on shutdown.
+
+With ``scenario_mode`` it runs beside autoware_carla_scenario, which owns the
+level, the ego (role name ``Ego``) and the clock: the node waits for that ego,
+spawns the sensor kit on it and neither loads, ticks nor teleports. An ego that
+was not spawned for CARLA's native Autoware interface (``ros2_autoware_control``
+and the role name ``ego`` / ``hero``) gets Autoware's vehicle interface from
+:mod:`.vehicle_interface` instead.
 """
 
 import os
@@ -60,6 +67,7 @@ from .sensor_kit import load_sensor_kit
 from .traffic_light_matcher import parse_id_map_override
 from .transforms import Pose
 from .transforms import quaternion_to_rpy
+from .vehicle_interface import ClientSideVehicleInterface
 
 EGO_ROLE_NAMES = ("ego", "hero")
 
@@ -129,6 +137,8 @@ class CarlaAutowareNode(Node):
         self._traffic_light_actors = None
         self._traffic_light_groups = None
         self._sensor_kit = None
+        self._vehicle_interface = None
+        self._spawned_ego = False
 
     # ------------------------------------------------------------------ setup
     def _declare_parameters(self):
@@ -145,7 +155,15 @@ class CarlaAutowareNode(Node):
             "resync": True,
             "no_rendering_mode": False,
             "publish_tf": False,
-            "ego_role_name": "ego",
+            # Attach to the ego, world and clock of autoware_carla_scenario
+            # instead of providing them (see start()).
+            "scenario_mode": False,
+            "ego_wait_timeout": 60.0,
+            # "" -> "Ego" in scenario mode (autoware_carla_scenario's name), "ego" otherwise.
+            "ego_role_name": "",
+            # auto: CARLA's native Autoware interface when the ego is registered
+            # for it, the client-side one otherwise; native / client force one.
+            "vehicle_interface": "auto",
             "vehicle_blueprint": "",
             "spawn_point": "",
             "spawn_index": -1,
@@ -168,21 +186,63 @@ class CarlaAutowareNode(Node):
     def param(self, name):
         return self.get_parameter(name).value
 
+    def role_name(self):
+        role = self.param("ego_role_name").strip()
+        if role:
+            return role
+        return "Ego" if self.param("scenario_mode") else "ego"
+
     def start(self):
-        """Connect, prepare the world and the ego, and start ticking."""
+        """Connect, prepare the world and the ego, and start ticking.
+
+        Standalone, the node owns the session: it loads the level, applies
+        synchronous mode, spawns the ego and ticks the world. With
+        ``scenario_mode`` (autoware_carla_scenario runs the session) it only
+        attaches: it waits for the ego the scenario spawned, leaves the level,
+        the settings and the clock alone, and spawns the sensor kit on that ego.
+        """
         self._connect()
-        self._load_world()
-        self._apply_settings()
         self._sensor_kit = load_sensor_kit(self.param("sensor_kit_file"))
-        self._spawn_ego()
+        if self.param("scenario_mode"):
+            self._world = self._client.get_world()
+            self._attach_ego()
+        else:
+            self._load_world()
+            self._apply_settings()
+            self._spawn_ego()
+        self._spawn_base_link_and_status()
         self._spawn_sensors()
         self._create_interfaces()
         self._running.set()
-        if self.param("sync_mode"):
+        if not self.param("scenario_mode") and self.param("sync_mode"):
             self._tick_thread = threading.Thread(target=self._tick_loop, daemon=True)
             self._tick_thread.start()
-        else:
-            self._world.wait_for_tick()
+
+    def _attach_ego(self):
+        """Wait for the vehicle with our role name (spawned by the scenario)."""
+        role = self.role_name()
+        deadline = time.monotonic() + float(self.param("ego_wait_timeout"))
+        self.get_logger().info(f"scenario_mode: waiting for the ego (role_name '{role}')")
+        while True:
+            for actor in self._world.get_actors().filter("vehicle.*"):
+                if actor.attributes.get("role_name") == role:
+                    self._ego = as_vehicle(actor)
+                    self.get_logger().info(f"Attached to ego {actor.type_id} (id {actor.id})")
+                    return
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"No vehicle with role_name '{role}' appeared")
+            time.sleep(0.5)
+
+    def _uses_native_vehicle_interface(self):
+        """Whether CARLA itself serves Autoware's vehicle interface for the ego."""
+        mode = self.param("vehicle_interface")
+        if mode in ("native", "client"):
+            return mode == "native"
+        attributes = self._ego.attributes
+        return (
+            attributes.get("ros2_autoware_control") == "true"
+            and attributes.get("role_name") in EGO_ROLE_NAMES
+        )
 
     def _connect(self):
         host, port = self.param("host"), int(self.param("port"))
@@ -246,7 +306,7 @@ class CarlaAutowareNode(Node):
         library = self._world.get_blueprint_library()
         name = self.param("vehicle_blueprint").strip() or self._sensor_kit.vehicle_blueprint
         blueprint = library.find(name)
-        role = self.param("ego_role_name")
+        role = self.role_name()
         if role not in EGO_ROLE_NAMES:
             self.get_logger().warning(
                 f"ego_role_name '{role}': CARLA only drives a vehicle named one of {EGO_ROLE_NAMES}"
@@ -264,8 +324,21 @@ class CarlaAutowareNode(Node):
         if actor is None:
             raise RuntimeError(f"Could not spawn '{name}' at {spawn_point}")
         self._ego = as_vehicle(actor)
+        self._spawned_ego = True
         self.get_logger().info(f"Spawned ego '{name}' (id {actor.id}) at {spawn_point}")
 
+    def _spawn_base_link_and_status(self):
+        library = self._world.get_blueprint_library()
+
+        if not self._uses_native_vehicle_interface():
+            self.get_logger().info(
+                "The ego is not registered for CARLA's Autoware interface: applying "
+                "control_cmd (as Ackermann control) and publishing /vehicle/status/* here"
+            )
+            self._vehicle_interface = ClientSideVehicleInterface(
+                self, self._world, self._ego, carla, self._carla_lock
+            )
+            return
         # The vehicle status sensor reports from the rear axle (base_link) and
         # publishes /vehicle/status/* through a global publisher.
         base_link = self._spawn(
@@ -313,9 +386,11 @@ class CarlaAutowareNode(Node):
             self.create_subscription(
                 HazardLightsCommand, "/control/command/hazard_lights_cmd", self._on_hazard, qos
             )
-        self.create_subscription(
-            PoseWithCovarianceStamped, "/initialpose", self._on_initial_pose, 1
-        )
+        if not self.param("scenario_mode"):
+            # The scenario places its ego; a teleport would fight it.
+            self.create_subscription(
+                PoseWithCovarianceStamped, "/initialpose", self._on_initial_pose, 1
+            )
         if self.param("traffic_light.publish"):
             self._traffic_light_pub = self.create_publisher(
                 TrafficLightGroupArray, self.param("traffic_light.topic"), 1
@@ -453,6 +528,9 @@ class CarlaAutowareNode(Node):
         self._running.clear()
         if self._tick_thread is not None:
             self._tick_thread.join(timeout=5.0)
+        if self._vehicle_interface is not None:
+            self._vehicle_interface.close()
+            self._vehicle_interface = None
         if self._world is None:
             return
         for actor in reversed(self._spawned):
@@ -463,7 +541,7 @@ class CarlaAutowareNode(Node):
                 actor.destroy()
             except RuntimeError as error:
                 self.get_logger().warning(f"Could not destroy actor {actor.id}: {error}")
-        if self._ego is not None:
+        if self._ego is not None and self._spawned_ego:
             try:
                 self._ego.destroy()
             except RuntimeError as error:

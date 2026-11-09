@@ -93,3 +93,54 @@ def test_node_spawns_ticks_and_cleans_up(node):
     assert world.get_actor(ego_id) is None
     assert len(world.get_actors(spawned_ids)) == 0
     assert world.get_settings().synchronous_mode == settings_before
+
+
+def test_scenario_mode_attaches_to_an_existing_ego():
+    """As beside autoware_carla_scenario: the ego exists (role 'Ego'), someone else ticks."""
+    import rclpy
+    from rclpy.parameter import Parameter
+
+    from autoware_carla_interface_v2.carla_client import carla
+    from autoware_carla_interface_v2.node import CarlaAutowareNode
+
+    client = carla.Client(HOST, PORT)
+    client.set_timeout(60.0)
+    world = client.get_world()
+    blueprint = world.get_blueprint_library().find("vehicle.lincoln.mkz")
+    blueprint.set_attribute("role_name", "Ego")
+    points = list(world.get_map().get_spawn_points())
+    ego = next(
+        actor
+        for actor in (world.try_spawn_actor(blueprint, p) for p in points)
+        if actor is not None
+    )
+    rclpy.init()
+    node = CarlaAutowareNode(
+        parameter_overrides=[
+            Parameter("host", value=HOST),
+            Parameter("port", value=PORT),
+            Parameter("timeout", value=60.0),
+            Parameter("scenario_mode", value=True),
+            Parameter("no_rendering_mode", value=True),
+        ]
+    )
+    try:
+        node.start()
+        assert node._ego.id == ego.id
+        assert node._tick_thread is None  # the scenario owns the clock
+        assert node._vehicle_interface is not None  # 'Ego' is not served natively
+        sensor_ids = [actor.id for actor in node._spawned]
+        assert all(a.parent is not None for a in world.get_actors(sensor_ids))
+        for _ in range(5):
+            if world.get_settings().synchronous_mode:
+                world.tick()  # stands in for the scenario's tick
+            else:
+                world.wait_for_tick()
+            rclpy.spin_once(node, timeout_sec=0.1)
+        node.shutdown()
+        assert world.get_actor(ego.id) is not None  # the scenario's ego is left alone
+        assert len(world.get_actors(sensor_ids)) == 0
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+        ego.destroy()

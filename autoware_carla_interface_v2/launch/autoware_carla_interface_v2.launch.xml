@@ -1,4 +1,8 @@
 <launch>
+  <!-- Run beside autoware_carla_scenario: attach to its ego, world and clock instead of providing them -->
+  <arg name="scenario_mode" default="false"/>
+  <arg name="ego_wait_timeout" default="60.0" description="scenario_mode: how long to wait for the scenario's ego [s]"/>
+  <arg name="vehicle_interface" default="auto" description="auto | native | client: who applies control_cmd and publishes /vehicle/status/*"/>
   <!-- CARLA server -->
   <arg name="host" default="localhost"/>
   <arg name="port" default="2000"/>
@@ -14,7 +18,7 @@
   <arg name="no_rendering_mode" default="false" description="Disable rendering; cameras are then not spawned (a -nullrhi server crashes on them)"/>
 
   <!-- Ego and sensors -->
-  <arg name="ego_role_name" default="ego"/>
+  <arg name="ego_role_name" default="" description="Empty: Ego in scenario_mode (autoware_carla_scenario), ego otherwise"/>
   <arg name="vehicle_blueprint" default="" description="Empty uses the vehicle of the sensor kit file"/>
   <arg name="spawn_point" default="" description="x,y,z,roll,pitch,yaw in CARLA coordinates (m, deg); empty uses spawn_index"/>
   <arg name="spawn_index" default="-1" description="Index into the level's ego spawn points; negative picks one at random"/>
@@ -44,6 +48,9 @@
     <param name="fixed_delta_seconds" value="$(var fixed_delta_seconds)"/>
     <param name="time_scale" value="$(var time_scale)"/>
     <param name="no_rendering_mode" value="$(var no_rendering_mode)"/>
+    <param name="scenario_mode" value="$(var scenario_mode)"/>
+    <param name="ego_wait_timeout" value="$(var ego_wait_timeout)"/>
+    <param name="vehicle_interface" value="$(var vehicle_interface)"/>
     <param name="ego_role_name" value="$(var ego_role_name)"/>
     <param name="vehicle_blueprint" value="$(var vehicle_blueprint)"/>
     <param name="spawn_point" value="$(var spawn_point)"/>

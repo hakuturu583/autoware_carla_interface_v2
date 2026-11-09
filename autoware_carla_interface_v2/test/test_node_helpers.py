@@ -73,3 +73,27 @@ def test_carla_transform_round_trip():
     assert transform.rotation.yaw == pytest.approx(-60.0)
     back = from_carla_transform(transform)
     assert (back.x, back.y, back.z, back.yaw) == pytest.approx((1.0, 2.0, 0.3, math.pi / 3))
+
+
+@pytest.mark.parametrize(
+    "scenario_mode, role, expected",
+    [(False, "", "ego"), (True, "", "Ego"), (True, "hero", "hero")],
+)
+def test_role_name_defaults_follow_the_mode(scenario_mode, role, expected):
+    import rclpy
+    from rclpy.parameter import Parameter
+
+    from autoware_carla_interface_v2.node import CarlaAutowareNode
+
+    rclpy.init()
+    try:
+        node = CarlaAutowareNode(
+            parameter_overrides=[
+                Parameter("scenario_mode", value=scenario_mode),
+                Parameter("ego_role_name", value=role),
+            ]
+        )
+        assert node.role_name() == expected
+        node.destroy_node()
+    finally:
+        rclpy.shutdown()

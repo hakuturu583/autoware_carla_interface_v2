@@ -35,6 +35,7 @@ _CLIENT = ("typesafe_carla",)
 _NODE = _CLIENT + (
     "rclpy",
     "ament_index_python",
+    "autoware_control_msgs",
     "autoware_perception_msgs",
     "autoware_vehicle_msgs",
     "geometry_msgs",
