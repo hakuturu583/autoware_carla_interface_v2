@@ -1,0 +1,69 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>autoware_carla_interface_v2</name>
+  <version>1.0.0</version>
+  <description>CARLA 1.0 (UE5) - Autoware bridge, talking to the simulator through the typesafe_carla client</description>
+  <maintainer email="masaya.kataoka@tier4.jp">Masaya Kataoka</maintainer>
+  <license>Apache License 2.0</license>
+
+  <url type="repository">https://github.com/hakuturu583/autoware_carla_interface_v2</url>
+  <url type="bugtracker">https://github.com/hakuturu583/autoware_carla_interface_v2/issues</url>
+
+  <author email="mradityagio@gmail.com">Muhammad Raditya GIOVANNI</author>
+  <author email="maxime.clement@tier4.jp">Maxime CLEMENT</author>
+  <author email="bin.wang@tier4.jp">Bin Wang</author>
+  <author email="ujin@tukorea.ac.kr">Ujin Kwon</author>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <buildtool_depend>ament_cmake_python</buildtool_depend>
+  <buildtool_depend>autoware_cmake</buildtool_depend>
+
+  <!-- C++ utility nodes (carla_state_publisher, carla_operation_mode_publisher) -->
+  <depend>autoware_adapi_v1_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>rclcpp</depend>
+  <depend>rclcpp_components</depend>
+  <depend>tf2</depend>
+  <depend>tf2_ros</depend>
+
+  <!-- The Python bridge -->
+  <exec_depend>ament_index_python</exec_depend>
+  <exec_depend>autoware_perception_msgs</exec_depend>
+  <exec_depend>autoware_vehicle_msgs</exec_depend>
+  <exec_depend>builtin_interfaces</exec_depend>
+  <exec_depend>cv_bridge</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-opencv</exec_depend>
+  <exec_depend>python3-transforms3d</exec_depend>
+  <!-- The CARLA client (https://pypi.org/project/typesafe-carla/). Not in rosdistro yet:
+       see rosdep/typesafe_carla.yaml and the README for how to resolve this key. -->
+  <exec_depend>python3-typesafe-carla-pip</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>rosgraph_msgs</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>sensor_msgs_py</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>tf2_msgs</exec_depend>
+  <exec_depend>tier4_vehicle_msgs</exec_depend>
+
+  <!-- Nodes started by the launch file -->
+  <exec_depend>autoware_agnocast_wrapper</exec_depend>
+  <exec_depend>autoware_external_cmd_selector</exec_depend>
+  <exec_depend>autoware_lanelet2_extension_python</exec_depend>
+  <exec_depend>autoware_raw_vehicle_cmd_converter</exec_depend>
+  <exec_depend>autoware_twist2accel</exec_depend>
+  <exec_depend>autoware_vehicle_velocity_converter</exec_depend>
+  <exec_depend>image_transport</exec_depend>
+  <exec_depend>topic_tools</exec_depend>
+
+  <test_depend>ament_cmake_pytest</test_depend>
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>autoware_lint_common</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

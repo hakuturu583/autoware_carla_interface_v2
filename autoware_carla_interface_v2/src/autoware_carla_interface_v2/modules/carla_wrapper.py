@@ -1,0 +1,391 @@
+#!/usr/bin/env python3
+
+# Copyright 2024 Tier IV, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from __future__ import print_function
+
+import logging
+from queue import Queue
+
+import numpy as np
+
+from .carla_client import as_sensor
+from .carla_client import carla
+from .carla_client import to_measurement
+from .carla_data_provider import CarlaDataProvider
+
+
+# Sensor Wrapper for Agent
+class SensorReceivedNoData(Exception):
+    """Exceptions when no data received from the sensors."""
+
+
+class GenericMeasurement(object):
+
+    def __init__(self, data, frame):
+        self.data = data
+        self.frame = frame
+
+
+class CallBack(object):
+
+    def __init__(self, tag, sensor, data_provider):
+        self._tag = tag
+        self._data_provider = data_provider
+
+        self._data_provider.register_sensor(tag, sensor)
+
+    def __call__(self, data):
+        # typesafe_carla hands every callback a generic carla.SensorData.
+        data = to_measurement(data)
+        if isinstance(data, carla.Image):
+            self._parse_image_cb(data, self._tag)
+        elif isinstance(data, carla.LidarMeasurement):
+            self._parse_lidar_cb(data, self._tag)
+        elif isinstance(data, carla.GnssMeasurement):
+            self._parse_gnss_cb(data, self._tag)
+        elif isinstance(data, carla.IMUMeasurement):
+            self._parse_imu_cb(data, self._tag)
+        elif isinstance(data, GenericMeasurement):
+            self._parse_pseudo_sensor(data, self._tag)
+        else:
+            logging.error("No callback method for this sensor.")
+
+    # Parsing CARLA physical Sensors
+    def _parse_image_cb(self, image, tag):
+        self._data_provider.update_sensor(tag, image, image.frame)
+
+    def _parse_lidar_cb(self, lidar_data, tag):
+        self._data_provider.update_sensor(tag, lidar_data, lidar_data.frame)
+
+    def _parse_imu_cb(self, imu_data, tag):
+        self._data_provider.update_sensor(tag, imu_data, imu_data.frame)
+
+    def _parse_gnss_cb(self, gnss_data, tag):
+        array = np.array(
+            [gnss_data.latitude, gnss_data.longitude, gnss_data.altitude], dtype=np.float64
+        )
+        self._data_provider.update_sensor(tag, array, gnss_data.frame)
+
+    def _parse_pseudo_sensor(self, package, tag):
+        self._data_provider.update_sensor(tag, package.data, package.frame)
+
+
+class SensorInterface(object):
+    """Interface for collecting sensor data from CARLA."""
+
+    def __init__(self):
+        """Initialize sensor interface."""
+        self._sensors_objects = {}
+        self._new_data_buffers = Queue()
+        # Measurements taken after the frame currently being processed, kept
+        # for the call that reaches their frame.
+        self._held = []
+        self.tag = ""  # Current sensor tag
+
+    def register_sensor(self, tag, sensor):
+        self.tag = tag
+        if tag in self._sensors_objects:
+            raise ValueError(f"Duplicated sensor tag [{tag}]")
+
+        self._sensors_objects[tag] = sensor
+
+    def update_sensor(self, tag, data, frame):
+        if tag not in self._sensors_objects:
+            raise ValueError(f"Sensor with tag [{tag}] has not been created")
+
+        self._new_data_buffers.put((tag, frame, data))
+
+    def get_data(self, target_frame):
+        """Return every measurement captured at or before target_frame.
+
+        Sensor callbacks run asynchronously, so a measurement can reach the
+        queue after the loop has moved past the frame it was captured on, and a
+        sensor faster than the simulation step can deliver several between two
+        calls. Returning (tag, frame, data) rather than the latest measurement
+        per sensor keeps both: the caller can stamp each measurement with the
+        time of the frame it was actually captured on, and nothing captured is
+        silently discarded on the way.
+
+        Measurements from frames the loop has not reached yet are held for the
+        call that does, so they are never stamped with a time before their own.
+        """
+        from queue import Empty
+
+        pending = self._held
+        self._held = []
+
+        while True:
+            try:
+                pending.append(self._new_data_buffers.get(block=False))
+            except Empty:
+                break
+
+        due = []
+        for measurement in pending:
+            (due if measurement[1] <= target_frame else self._held).append(measurement)
+        return due
+
+
+# Sensor Wrapper
+
+
+class SensorWrapper(object):
+    """Wrapper for managing CARLA sensors attached to a vehicle."""
+
+    def __init__(self, agent):
+        """
+        Initialize sensor wrapper.
+
+        Args:
+        ----
+            agent: Agent instance containing sensor configuration
+
+        """
+        self._agent = agent
+        self._sensors_list = []  # Instance variable, not class variable
+
+    def __call__(self):
+        return self._agent()
+
+    def setup_sensors(self, vehicle, debug_mode=False):
+        """
+        Create and attach sensors defined via sensor configuration.
+
+        Args:
+        ----
+            vehicle: CARLA vehicle actor to attach sensors to
+            debug_mode: Enable debug logging (unused)
+
+        Raises
+        ------
+            RuntimeError: If sensor spawning fails critically
+
+        """
+        bp_library = CarlaDataProvider.get_world().get_blueprint_library()
+
+        for sensor_spec in self._agent.sensors["sensors"]:
+            self._setup_single_sensor(bp_library, sensor_spec, vehicle)
+
+        if not self._sensors_list:
+            raise RuntimeError("No sensors were successfully spawned. Check sensor configuration.")
+
+        # Tick once to spawn the sensors
+        CarlaDataProvider.get_world().tick()
+
+    def _setup_single_sensor(self, bp_library, sensor_spec, vehicle):
+        """
+        Set up a single sensor from specification.
+
+        Args:
+        ----
+            bp_library: CARLA blueprint library
+            sensor_spec: Sensor specification dictionary
+            vehicle: Vehicle to attach sensor to
+
+        """
+        try:
+            sensor_type = sensor_spec["type"]
+            sensor_id = sensor_spec.get("id", "unknown")
+
+            # Find and configure blueprint (typesafe_carla raises IndexError when absent)
+            try:
+                bp = bp_library.find(str(sensor_type))
+            except (IndexError, RuntimeError):
+                bp = None
+            if bp is None:
+                logging.error(f"Blueprint not found for sensor type: {sensor_type}")
+                return
+
+            if not self._configure_sensor_blueprint(bp, sensor_type, sensor_spec):
+                return
+
+            # Create and spawn sensor
+            sensor_transform = self._create_sensor_transform(sensor_spec["spawn_point"])
+            sensor = as_sensor(
+                CarlaDataProvider.get_world().spawn_actor(bp, sensor_transform, attach_to=vehicle)
+            )
+
+            if sensor is None:
+                logging.error(
+                    f"Failed to spawn sensor '{sensor_id}' of type {sensor_type}. "
+                    f"Check spawn position and vehicle attachment."
+                )
+                return
+
+            sensor.listen(CallBack(sensor_id, sensor, self._agent.sensor_interface))
+            self._sensors_list.append(sensor)
+            logging.info(f"Successfully spawned sensor '{sensor_id}' ({sensor_type})")
+
+        except KeyError as e:
+            logging.error(
+                f"Missing required key {e} in sensor spec: {sensor_spec.get('id', 'unknown')}"
+            )
+        except Exception as e:
+            logging.error(f"Failed to setup sensor '{sensor_spec.get('id', 'unknown')}': {e}")
+
+    def _configure_sensor_blueprint(self, bp, sensor_type, sensor_spec):
+        """
+        Configure sensor-specific blueprint attributes.
+
+        Args:
+        ----
+            bp: CARLA blueprint to configure
+            sensor_type: Type of sensor
+            sensor_spec: Sensor specification dictionary
+
+        Returns
+        -------
+            bool: True if configuration succeeded, False to skip sensor
+
+        """
+        if sensor_type.startswith("sensor.camera"):
+            self._configure_camera_attributes(bp, sensor_spec)
+        elif sensor_type.startswith("sensor.lidar"):
+            self._configure_lidar_attributes(bp, sensor_spec)
+        elif sensor_type.startswith("sensor.other.gnss"):
+            self._configure_gnss_attributes(bp, sensor_spec)
+        elif sensor_type.startswith("sensor.other.imu"):
+            self._configure_imu_attributes(bp, sensor_spec)
+        elif not sensor_type.startswith("sensor."):
+            logging.warning(f"Unknown sensor type: {sensor_type}, skipping spawn")
+            return False
+
+        # CARLA defaults sensor_tick to 0, which captures on every simulation
+        # step: at a 1/600 s step that is 600 captures a second per camera, and
+        # the rate is then decided solely by the bridge's frequency_hz throttle,
+        # which can only drop whole frames. A mapping asking for 60 Hz came out
+        # at 85.7 and a 200 Hz IMU at 300. Setting sensor_tick lets CARLA
+        # generate at the rate the mapping asks for instead.
+        if "sensor_tick" in sensor_spec:
+            self._set_attribute_if_supported(bp, "sensor_tick", str(sensor_spec["sensor_tick"]))
+        return True
+
+    def _configure_camera_attributes(self, bp, spec):
+        """Configure camera-specific attributes."""
+        self._set_attribute_if_supported(bp, "image_size_x", str(spec["image_size_x"]))
+        self._set_attribute_if_supported(bp, "image_size_y", str(spec["image_size_y"]))
+        self._set_attribute_if_supported(bp, "fov", str(spec["fov"]))
+
+    def _configure_lidar_attributes(self, bp, spec):
+        """Configure LiDAR-specific attributes."""
+        self._set_attribute_if_supported(bp, "range", str(spec["range"]))
+        self._set_attribute_if_supported(bp, "rotation_frequency", str(spec["rotation_frequency"]))
+        self._set_attribute_if_supported(bp, "channels", str(spec["channels"]))
+        self._set_attribute_if_supported(bp, "upper_fov", str(spec["upper_fov"]))
+        self._set_attribute_if_supported(bp, "lower_fov", str(spec["lower_fov"]))
+        self._set_attribute_if_supported(bp, "points_per_second", str(spec["points_per_second"]))
+
+    def _configure_gnss_attributes(self, bp, spec):
+        """Configure GNSS noise, clean unless the sensor mapping asks otherwise."""
+        for param in ["alt", "lat", "lon"]:
+            for quantity in ["stddev", "bias"]:
+                self._set_noise_attribute(bp, spec, f"noise_{param}_{quantity}")
+
+    def _configure_imu_attributes(self, bp, spec):
+        """Configure IMU noise, clean unless the sensor mapping asks otherwise."""
+        for quantity in ["accel_stddev", "gyro_stddev", "gyro_bias"]:
+            for axis in ["x", "y", "z"]:
+                self._set_noise_attribute(bp, spec, f"noise_{quantity}_{axis}")
+
+    @staticmethod
+    def _set_attribute_if_supported(bp, name, value):
+        """Set a blueprint attribute only when the blueprint exposes it.
+
+        CARLA sensor blueprints expose different attribute sets across
+        versions, so guarding with
+        ``has_attribute`` keeps sensor setup working on both instead of
+        raising when an attribute is absent.
+        """
+        if not bp.has_attribute(name):
+            return
+        bp.set_attribute(name, value)
+
+    @staticmethod
+    def _set_noise_attribute(bp, spec, name):
+        """Set one CARLA noise attribute, zero unless the mapping overrides it.
+
+        Zero keeps the noise-free measurements the bridge has always produced.
+        That is the right default for reproducing a run, but it makes anything
+        consuming these sensors look better than it would on a real vehicle,
+        so a sensor mapping can name the CARLA attribute under the sensor's
+        parameters and get a sensor that behaves like hardware.
+        """
+        if not bp.has_attribute(name):
+            return
+        bp.set_attribute(name, str(spec.get(name, 0.0)))
+
+    def _create_sensor_transform(self, spawn_point):
+        """
+        Create CARLA transform from spawn point dictionary.
+
+        Args:
+        ----
+            spawn_point: Dictionary with x, y, z, pitch, roll, yaw
+
+        Returns
+        -------
+            carla.Transform: Sensor transform
+
+        """
+        location = carla.Location(x=spawn_point["x"], y=spawn_point["y"], z=spawn_point["z"])
+        rotation = carla.Rotation(
+            pitch=spawn_point["pitch"], roll=spawn_point["roll"], yaw=spawn_point["yaw"]
+        )
+        return carla.Transform(location, rotation)
+
+    def cleanup(self):
+        """
+        Cleanup sensors robustly.
+
+        Stops and destroys all spawned sensors, continuing even if individual sensors fail to clean
+        up. This prevents resource leaks.
+
+        """
+        cleanup_errors = []
+
+        for i, sensor in enumerate(self._sensors_list):
+            if sensor is None:
+                continue
+
+            self._cleanup_single_sensor(sensor, i, cleanup_errors)
+            self._sensors_list[i] = None
+
+        self._sensors_list = []
+
+        # Log any cleanup errors but don't raise (we want to continue cleanup)
+        for error in cleanup_errors:
+            logging.warning(error)
+
+    def _cleanup_single_sensor(self, sensor, index, error_list):
+        """
+        Clean up a single sensor, collecting errors without raising.
+
+        Args:
+        ----
+            sensor: Sensor actor to clean up
+            index: Sensor index for error reporting
+            error_list: List to append error messages to
+
+        """
+        try:
+            sensor.stop()
+        except Exception as e:
+            error_list.append(f"Failed to stop sensor {index}: {e}")
+
+        try:
+            sensor.destroy()
+        except Exception as e:
+            error_list.append(f"Failed to destroy sensor {index}: {e}")

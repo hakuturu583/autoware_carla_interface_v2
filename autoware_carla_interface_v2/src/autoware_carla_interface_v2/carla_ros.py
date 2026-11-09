@@ -1,0 +1,2031 @@
+# Copyright 2024 Tier IV, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from collections import namedtuple
+import math
+import threading
+
+from autoware_perception_msgs.msg import DetectedObject
+from autoware_perception_msgs.msg import DetectedObjectKinematics
+from autoware_perception_msgs.msg import DetectedObjects
+from autoware_perception_msgs.msg import ObjectClassification
+from autoware_perception_msgs.msg import Shape
+from autoware_perception_msgs.msg import TrafficLightElement
+from autoware_perception_msgs.msg import TrafficLightGroup
+from autoware_perception_msgs.msg import TrafficLightGroupArray
+from autoware_vehicle_msgs.msg import ControlModeReport
+from autoware_vehicle_msgs.msg import GearCommand
+from autoware_vehicle_msgs.msg import GearReport
+from autoware_vehicle_msgs.msg import HazardLightsCommand
+from autoware_vehicle_msgs.msg import HazardLightsReport
+from autoware_vehicle_msgs.msg import SteeringReport
+from autoware_vehicle_msgs.msg import TurnIndicatorsCommand
+from autoware_vehicle_msgs.msg import TurnIndicatorsReport
+from autoware_vehicle_msgs.msg import VelocityReport
+from builtin_interfaces.msg import Time
+import cv2
+from cv_bridge import CvBridge
+from geometry_msgs.msg import Pose
+from geometry_msgs.msg import PoseWithCovarianceStamped
+from geometry_msgs.msg import TransformStamped
+from nav_msgs.msg import Odometry
+import numpy
+import rclpy
+from rclpy.qos import QoSDurabilityPolicy
+from rclpy.qos import QoSHistoryPolicy
+from rclpy.qos import QoSProfile
+from rclpy.qos import QoSReliabilityPolicy
+from rosgraph_msgs.msg import Clock
+from sensor_msgs.msg import CameraInfo
+from sensor_msgs.msg import Imu
+from sensor_msgs.msg import PointField
+from std_msgs.msg import Header
+from tf2_msgs.msg import TFMessage
+from tier4_vehicle_msgs.msg import ActuationCommandStamped
+from tier4_vehicle_msgs.msg import ActuationStatusStamped
+from transforms3d.euler import euler2quat
+
+# New modular sensor infrastructure
+from .modules import ROSPublisherManager
+from .modules import SensorKitLoader
+from .modules import SensorPublishWorker
+from .modules import SensorRegistry
+from .modules.carla_client import as_traffic_light
+from .modules.carla_client import carla
+from .modules.carla_data_provider import CarlaDataProvider
+from .modules.carla_data_provider import GameTime
+from .modules.carla_utils import carla_location_to_ros_point
+from .modules.carla_utils import carla_rotation_to_ros_quaternion
+from .modules.carla_utils import create_cloud
+from .modules.carla_utils import project_point_to_ground
+from .modules.carla_utils import ros_pose_to_carla_transform
+from .modules.carla_wrapper import SensorInterface
+from .modules.traffic_light_matcher import load_map_traffic_lights
+from .modules.traffic_light_matcher import match_traffic_lights
+from .modules.traffic_light_matcher import parse_id_map_override
+
+
+def _parse_geo_reference(xodr_xml: str):
+    """Extract ``(lat_0, lon_0)`` from the OpenDRIVE ``<geoReference>`` PROJ string."""
+    import re
+    import xml.etree.ElementTree as ET
+
+    match = re.search(
+        r"<geoReference>\s*(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?\s*</geoReference>",
+        xodr_xml,
+        re.DOTALL,
+    )
+    if match and match.group(1).strip():
+        proj_string = match.group(1).strip()
+    else:
+        root = ET.fromstring(xodr_xml)
+        geo_ref = root.find(".//geoReference")
+        if geo_ref is None or not geo_ref.text:
+            raise ValueError("No <geoReference> found in OpenDRIVE XML")
+        proj_string = geo_ref.text.strip()
+
+    lat_match = re.search(r"\+lat_0=([0-9eE.+-]+)", proj_string)
+    lon_match = re.search(r"\+lon_0=([0-9eE.+-]+)", proj_string)
+    if lat_match is None or lon_match is None:
+        raise ValueError(f"Cannot extract +lat_0/+lon_0 from geoReference: {proj_string}")
+    return float(lat_match.group(1)), float(lon_match.group(1))
+
+
+# Speed-unit conversions for the vehicle steering_curve lookup. The curve's speed
+# axis follows the UE vehicle plugin behind the CARLA version: Chaos (CARLA 0.10+,
+# UE5) samples it in mph, PhysX (CARLA 0.9.x, UE4) in km/h.
+MPS_TO_MPH = 2.2369362920544
+MPS_TO_KMH = 3.6
+
+# One consistent snapshot of the ego actor, read under a single lock so that the
+# published status reports all describe the same simulation step.
+EgoState = namedtuple(
+    "EgoState",
+    [
+        "transform",
+        "velocity",
+        "angular_velocity",
+        "steer_angle",
+        "control",
+        "light_state",
+        "gear",
+    ],
+)
+
+# CARLA blueprint base_type, lower-cased -> Autoware label (anything unlisted falls back to CAR)
+BASE_TYPE_TO_LABEL = {
+    "car": ObjectClassification.CAR,
+    "truck": ObjectClassification.TRUCK,
+    "van": ObjectClassification.TRUCK,
+    "bus": ObjectClassification.BUS,
+    "motorcycle": ObjectClassification.MOTORCYCLE,
+    "bicycle": ObjectClassification.BICYCLE,
+}
+
+# Gears that put the vehicle in reverse, and gears in which it must not pull
+# away. GearCommand and GearReport share the same constant numbering, so a
+# command value can be reported back unchanged.
+REVERSE_GEARS = (GearCommand.REVERSE, GearCommand.REVERSE_2)
+STANDSTILL_GEARS = (GearCommand.NONE, GearCommand.NEUTRAL, GearCommand.PARK)
+
+
+class carla_ros2_interface(object):
+
+    def _initialize_parameters(self):
+        """Initialize and declare ROS 2 parameters."""
+        # Parameter definitions: name -> (type, default_value)
+        # None means no default (must be provided by launch file)
+        self.parameters = {
+            "host": (rclpy.Parameter.Type.STRING, None),
+            "port": (rclpy.Parameter.Type.INTEGER, None),
+            "sync_mode": (rclpy.Parameter.Type.BOOL, None),
+            "timeout": (rclpy.Parameter.Type.INTEGER, None),
+            "fixed_delta_seconds": (rclpy.Parameter.Type.DOUBLE, None),
+            "carla_map": (rclpy.Parameter.Type.STRING, None),
+            "ego_vehicle_role_name": (rclpy.Parameter.Type.STRING, None),
+            "spawn_point": (rclpy.Parameter.Type.STRING, None),
+            "vehicle_type": (rclpy.Parameter.Type.STRING, None),
+            "use_traffic_manager": (rclpy.Parameter.Type.BOOL, None),
+            "max_real_delta_seconds": (rclpy.Parameter.Type.DOUBLE, None),
+            "tick_follower": (rclpy.Parameter.Type.BOOL, False),
+            "spawn_point_ground_snap": (rclpy.Parameter.Type.BOOL, False),
+            "spawn_point_ground_offset_z": (rclpy.Parameter.Type.DOUBLE, 0.5),
+            "initial_pose_ground_offset_z": (rclpy.Parameter.Type.DOUBLE, 1.0),
+            "force_load_world": (rclpy.Parameter.Type.BOOL, False),
+            # Longest physics substep CARLA may take inside one simulation
+            # step. 0 or negative leaves CARLA's own substepping settings
+            # untouched, which is what a 0.10 (Chaos) server wants; see the
+            # README.
+            "max_substep_delta_time": (rclpy.Parameter.Type.DOUBLE, 0.0),
+            # Minimum throttle applied while accelerating from (near) standstill.
+            # Heavy CARLA vehicles (e.g. vehicle.taxi.ford) do not creep and
+            # never start moving on the small throttle the actuation map yields
+            # at low target accelerations.
+            "min_positive_throttle": (rclpy.Parameter.Type.DOUBLE, 0.0),
+            "min_positive_throttle_speed_threshold": (rclpy.Parameter.Type.DOUBLE, 0.8),
+            # Also decides whether camera sensors are spawned at all: without rendering
+            # they can produce no image, and on a server started without a renderer
+            # (CarlaUnreal.sh -nullrhi) spawning one takes the server down. See
+            # _skip_cameras_in_no_rendering_mode.
+            "no_rendering_mode": (rclpy.Parameter.Type.BOOL, False),
+            # Publish the CARLA ground-truth localization (kinematic_state and
+            # the map->base_link TF) directly from the ego transform. Used by
+            # the E2E planning setup instead of the former carla_state_publisher
+            # GNSS round-trip, which duplicated these topics.
+            "publish_ground_truth_localization": (rclpy.Parameter.Type.BOOL, False),
+            "map_origin_x": (rclpy.Parameter.Type.DOUBLE, 0.0),
+            "map_origin_y": (rclpy.Parameter.Type.DOUBLE, 0.0),
+            "publish_ground_truth_objects": (rclpy.Parameter.Type.BOOL, False),
+            # Sensor configuration parameters
+            "sensor_kit_name": (rclpy.Parameter.Type.STRING, ""),  # Empty = use YAML default
+            "sensor_mapping_file": (rclpy.Parameter.Type.STRING, ""),
+            # Override the wheel max steer angle [deg] used to convert between
+            # tire angles and the normalized VehicleControl.steer. 0 uses the
+            # value reported by the vehicle physics. CARLA 0.10 (Chaos) reports
+            # 70 deg but only achieves roughly a third of it, so calibrating
+            # this to the measured full-steer angle restores a unity gain.
+            "max_wheel_steer_angle_deg": (rclpy.Parameter.Type.DOUBLE, 0.0),
+            # Replace the ego vehicle's speed-based steering curve with an
+            # identity curve (workaround for the corrupt curve data CARLA 0.10
+            # returns, which attenuates steering at driving speeds).
+            "flatten_steering_curve": (rclpy.Parameter.Type.BOOL, False),
+            # Nudge the ego physics body awake when launching from a standstill.
+            # Only needed on CARLA 0.10 (UE5/Chaos), where a stationary body is
+            # put to sleep and VehicleControl throttle does not wake it. Off by
+            # default so the supported 0.9.15 environment, where bodies never
+            # sleep, keeps its unmodified launch dynamics.
+            "wake_sleeping_physics": (rclpy.Parameter.Type.BOOL, False),
+            # Traffic-light bridging parameters, grouped under the
+            # "traffic_light." namespace so they stay together in `ros2 param list`.
+            #
+            # Publish the CARLA server's traffic-light states as an Autoware
+            # TrafficLightGroupArray on
+            # /perception/traffic_light_recognition/traffic_signals, bypassing
+            # camera-based recognition.
+            "traffic_light.publish": (rclpy.Parameter.Type.BOOL, False),
+            # Set every CARLA traffic light to green and freeze it there at
+            # startup (handled in carla_autoware). Useful for camera-less
+            # closed-loop runs that have no traffic-light recognition and would
+            # otherwise hold at every signalized stop line.
+            "traffic_light.force_green": (rclpy.Parameter.Type.BOOL, False),
+            # Path to the lanelet2 map (.osm). When set, each CARLA traffic
+            # light is matched by position to the map's traffic-light heads and
+            # its state is published under the matched regulatory-element
+            # (traffic_light_group) ids. Empty falls back to using the CARLA
+            # OpenDRIVE signal id directly as the group id.
+            "traffic_light.map_path": (rclpy.Parameter.Type.STRING, ""),
+            # Maximum head-to-head distance (m) accepted when matching a CARLA
+            # traffic light to a lanelet2 traffic-light head.
+            "traffic_light.match_distance": (rclpy.Parameter.Type.DOUBLE, 5.0),
+            # A position match is rejected as ambiguous when the closest head
+            # that resolves to a different regulatory element is nearly as close
+            # as the winner (nearest > ratio * second). Lower is stricter.
+            "traffic_light.match_ratio": (rclpy.Parameter.Type.DOUBLE, 0.6),
+            # Optional override, formatted "opendrive_id:group_id[|group_id...],...".
+            # Pins a CARLA OpenDRIVE signal id to one or more Autoware group ids,
+            # taking precedence over position matching (use it to recover the few
+            # lights the matcher reports as ambiguous or unmatched; the |-separated
+            # list lets a shared head map to all of its regulatory elements).
+            "traffic_light.id_map": (rclpy.Parameter.Type.STRING, ""),
+        }
+
+        self.param_values = {}
+        for param_name, (param_type, default_value) in self.parameters.items():
+            if default_value is not None:
+                self.ros2_node.declare_parameter(param_name, default_value)
+            else:
+                self.ros2_node.declare_parameter(param_name, param_type)
+            self.param_values[param_name] = self.ros2_node.get_parameter(param_name).value
+
+    def _initialize_clock_publisher(self):
+        """Initialize and publish initial clock message."""
+        self.clock_publisher = self.ros2_node.create_publisher(Clock, "/clock", 10)
+        obj_clock = Clock()
+        obj_clock.clock = Time(sec=0)
+        self.clock_publisher.publish(obj_clock)
+
+    def _setup_tf_listener(self):
+        """Initialize TF buffer/listener for map alignment."""
+        self.tf_buffer = None
+        self.tf_listener = None
+
+    def _initialize_status_publishers(self):
+        """
+        Initialize all vehicle status publishers.
+
+        Note: GNSS pose publisher is now managed via sensor registry.
+        Only vehicle status publishers are created here.
+
+        """
+        self.pub_vel_state = self.ros2_node.create_publisher(
+            VelocityReport, "/vehicle/status/velocity_status", 1
+        )
+        self.pub_steering_state = self.ros2_node.create_publisher(
+            SteeringReport, "/vehicle/status/steering_status", 1
+        )
+        self.pub_ctrl_mode = self.ros2_node.create_publisher(
+            ControlModeReport, "/vehicle/status/control_mode", 1
+        )
+        self.pub_gear_state = self.ros2_node.create_publisher(
+            GearReport, "/vehicle/status/gear_status", 1
+        )
+        self.pub_actuation_status = self.ros2_node.create_publisher(
+            ActuationStatusStamped, "/vehicle/status/actuation_status", 1
+        )
+        if self.param_values.get("publish_ground_truth_localization", False):
+            self.pub_gt_tf = self.ros2_node.create_publisher(TFMessage, "/tf", 10)
+            self.pub_gt_odom = self.ros2_node.create_publisher(
+                Odometry, "/localization/kinematic_state", 10
+            )
+        self.pub_turn_indicators_state = self.ros2_node.create_publisher(
+            TurnIndicatorsReport, "/vehicle/status/turn_indicators_status", 1
+        )
+        self.pub_hazard_lights_state = self.ros2_node.create_publisher(
+            HazardLightsReport, "/vehicle/status/hazard_lights_status", 1
+        )
+        if self.param_values.get("traffic_light.publish", False):
+            self.pub_traffic_signals = self.ros2_node.create_publisher(
+                TrafficLightGroupArray,
+                "/perception/traffic_light_recognition/traffic_signals",
+                1,
+            )
+
+        self.pub_ground_truth_objects = None
+        if self.param_values["publish_ground_truth_objects"]:
+            self.pub_ground_truth_objects = self.ros2_node.create_publisher(
+                DetectedObjects, "/perception/object_recognition/detection/objects", 1
+            )
+
+    def _initialize_subscriptions(self):
+        """Initialize all ROS 2 subscriptions."""
+        self.sub_control = self.ros2_node.create_subscription(
+            ActuationCommandStamped, "/control/command/actuation_cmd", self.control_callback, 1
+        )
+        self.sub_vehicle_initialpose = self.ros2_node.create_subscription(
+            PoseWithCovarianceStamped, "initialpose", self.initialpose_callback, 1
+        )
+        # A publisher that latches its initial pose (TRANSIENT_LOCAL) and sends
+        # it once -- a scenario runner placing the ego, a replay script, a
+        # `ros2 topic pub --qos-durability transient_local` -- typically does so
+        # long before this node has a world to put an ego in. The volatile
+        # subscription above is compatible with such a publisher, so the two
+        # connect; but a volatile reader is not given the sample that was
+        # latched before it arrived, and a publisher that sends it once never
+        # sends it again. The pose is then lost and the ego stays wherever
+        # `spawn_point` put it, which defaults to a random point on the map.
+        #
+        # A second subscription asking for TRANSIENT_LOCAL is given that sample
+        # when it connects, whenever this node comes up. Both are needed: RViz's
+        # "2D Pose Estimate" publishes volatile, which a TRANSIENT_LOCAL reader
+        # is incompatible with and would never receive at all.
+        # https://design.ros2.org/articles/qos.html
+        self.sub_vehicle_initialpose_latched = self.ros2_node.create_subscription(
+            PoseWithCovarianceStamped,
+            "initialpose",
+            self.initialpose_callback,
+            QoSProfile(
+                depth=1,
+                history=QoSHistoryPolicy.KEEP_LAST,
+                reliability=QoSReliabilityPolicy.RELIABLE,
+                durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+            ),
+        )
+        self.sub_turn_indicators = self.ros2_node.create_subscription(
+            TurnIndicatorsCommand,
+            "/control/command/turn_indicators_cmd",
+            self.turn_indicators_callback,
+            1,
+        )
+        self.sub_hazard_lights = self.ros2_node.create_subscription(
+            HazardLightsCommand,
+            "/control/command/hazard_lights_cmd",
+            self.hazard_lights_callback,
+            1,
+        )
+        self.sub_gear = self.ros2_node.create_subscription(
+            GearCommand, "/control/command/gear_cmd", self.gear_callback, 1
+        )
+        self.current_control = carla.VehicleControl()
+
+    def _load_sensor_configuration(self):
+        """Load sensor configuration and prepare publishers/metadata."""
+        self.sensor_registry.clear()
+        self.sensor_configs = []
+
+        mapping_file = self.param_values.get("sensor_mapping_file", "")
+        if not self.sensor_loader.load_sensor_mapping(mapping_file):
+            raise FileNotFoundError(
+                "Unable to locate sensor mapping YAML. "
+                "Provide --ros-args -p sensor_mapping_file:=<path>"
+            )
+
+        sensor_kit_name = self._resolve_sensor_kit_name()
+        self.logger.info(f"Using Autoware sensor kit calibration: {sensor_kit_name}")
+
+        try:
+            self.sensor_configs = self.sensor_loader.build_sensor_configs(
+                sensor_kit_name=sensor_kit_name
+            )
+        except Exception as exc:
+            self.logger.error(f"Failed to build sensor configuration from kit: {exc}")
+            raise
+
+        if not self.sensor_configs:
+            raise RuntimeError(
+                "Sensor mapping produced zero sensors. "
+                "Check enabled_sensors list and calibration files."
+            )
+
+        self._register_sensor_configs(self.sensor_configs)
+        self._create_sensor_publishers_from_registry()
+        sensor_specs = self._skip_cameras_in_no_rendering_mode(
+            self._build_sensor_specs(self.sensor_configs)
+        )
+        self.sensors = {"sensors": sensor_specs}
+
+        self.logger.info(f"Configured {len(self.sensor_configs)} sensors from mapping")
+
+    def _resolve_sensor_kit_name(self) -> str:
+        """Resolve the effective sensor kit name based on parameters and mapping."""
+        param_value = (self.param_values.get("sensor_kit_name", "") or "").strip()
+        if param_value:
+            return param_value
+
+        mapping_default = self.sensor_loader.sensor_mapping.get("default_sensor_kit_name", "")
+        if mapping_default:
+            return mapping_default
+
+        self.logger.warning("No sensor kit name provided; using fallback 'sample_sensor_kit'")
+        return "sample_sensor_kit"
+
+    def _register_sensor_configs(self, configs):
+        """Register sensors with the registry and update lookup tables."""
+        self.id_to_sensor_type_map.clear()
+        for config in configs:
+            self.sensor_registry.register_sensor(config)
+            self.id_to_sensor_type_map[config.sensor_id] = config.carla_type
+
+    def _create_sensor_publishers_from_registry(self):
+        """Create ROS publishers for all configured sensors."""
+        self.ros_publisher_manager.create_publishers_for_registry(self.sensor_registry)
+
+        for sensor_id, sensor in self.sensor_registry.get_all_sensors().items():
+            if sensor.sensor_type.startswith("pseudo."):
+                continue
+
+            if sensor.carla_type.startswith("sensor.camera"):
+                self.pub_camera[sensor_id] = sensor.publisher
+                self.pub_camera_info[sensor_id] = sensor.publisher_info
+            elif sensor.carla_type.startswith("sensor.lidar"):
+                self.pub_lidar[sensor_id] = sensor.publisher
+            elif sensor.carla_type.startswith("sensor.other.imu"):
+                self.pub_imu = sensor.publisher
+
+    def _build_sensor_specs(self, configs):
+        """Convert sensor config objects to CARLA sensor specifications."""
+        sensor_specs = []
+
+        for config in configs:
+            transform = config.transform or {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0,
+                "roll": 0.0,
+                "pitch": 0.0,
+                "yaw": 0.0,
+            }
+
+            spec = {
+                "type": config.carla_type,
+                "id": config.sensor_id,
+                "spawn_point": transform,
+            }
+
+            spec.update(config.parameters)
+            sensor_specs.append(spec)
+
+        return sensor_specs
+
+    def _skip_cameras_in_no_rendering_mode(self, sensor_specs):
+        """Drop cameras from the CARLA spawn list while rendering is off.
+
+        no_rendering_mode turns the scene rendering off, so a camera could only ever return
+        an empty image. Worse, the same flag is what a renderer-less server
+        (CarlaUnreal.sh -nullrhi) is run with, and there spawning a camera **segfaults the
+        server**; every call after that fails with an opaque ``RuntimeError: std::exception``,
+        which buries the real cause. A client cannot detect such a server - its world settings,
+        blueprint library and sensor attributes are identical to a rendering one - so follow
+        no_rendering_mode and leave the cameras out of the spawn list. Their topics stay
+        advertised but silent; every other sensor is unaffected.
+
+        Only the sensors still bound for CARLA reach this point, so cameras handed to an
+        external renderer earlier are untouched.
+        """
+        if not self.param_values["no_rendering_mode"]:
+            return sensor_specs
+        kept = [spec for spec in sensor_specs if not spec["type"].startswith("sensor.camera")]
+        skipped = [spec["id"] for spec in sensor_specs if spec["type"].startswith("sensor.camera")]
+        if skipped:
+            self.logger.warning(
+                f"no_rendering_mode is set, so the camera sensors in the mapping "
+                f"({', '.join(skipped)}) are not spawned in CARLA: without rendering they can "
+                "produce no image, and on a server started without a renderer "
+                "(CarlaUnreal.sh -nullrhi) spawning one crashes the server. Their topics stay "
+                "silent."
+            )
+        return kept
+
+    def __init__(self):
+        # Initialize instance variables
+        self._initialize_instance_variables()
+
+        # Initialize ROS 2 node
+        rclpy.init(args=None)
+        self.ros2_node = rclpy.create_node("carla_ros2_interface")
+        self.logger = self.ros2_node.get_logger()
+        self.sensor_registry.logger = self.logger
+        self.ros_publisher_manager = ROSPublisherManager(self.ros2_node, logger=self.logger)
+
+        # Setup all components
+        self._initialize_parameters()
+        self._setup_tf_listener()
+        self._initialize_clock_publisher()
+
+        self._load_sensor_configuration()
+
+        # Initialize publishers and subscriptions
+        self._initialize_subscriptions()
+        self._initialize_status_publishers()
+
+        # Start ROS 2 spin thread (Thread Safety: Shared state protected by self._state_lock)
+        self.spin_thread = threading.Thread(target=rclpy.spin, args=(self.ros2_node,))
+        self.spin_thread.start()
+
+    def _initialize_instance_variables(self):
+        """Initialize baseline state before the ROS node is created."""
+        # Sensor data bridge
+        self.sensor_interface = SensorInterface()
+
+        # Sensor metadata managers
+        self.sensor_registry = SensorRegistry()
+        self.sensor_loader = SensorKitLoader()
+        self.sensor_configs = []
+
+        # Legacy compatibility containers (gradually phased out)
+        self.id_to_sensor_type_map = {}
+        self.pub_camera = {}
+        self.pub_camera_info = {}
+        self.pub_lidar = {}
+        self.pub_imu = None
+        self.pub_traffic_signals = None
+        self.camera_info_cache = {}
+
+        # Traffic-light publishing state, resolved lazily on the first tick that
+        # publishes (the CARLA world is not populated at construction time).
+        self._traffic_light_actors = None
+        # actor id -> [Autoware traffic_light_group_id, ...] resolved by the
+        # position matcher (or the OpenDRIVE-id fallback).
+        self._traffic_light_actor_groups = None
+
+        # Vehicle and control state
+        self.prev_timestamp = None
+        self.prev_steer_output = 0.0
+        self.tau = 0.2
+        self._max_steer_angle_rad = None
+        self._physics_max_steer_angle_rad = None
+        # CARLA server version and the capability flags derived from it. Set by
+        # set_carla_version() once the world is loaded; until then we assume the
+        # measured wheel angle is usable (0.9.x behavior).
+        self.carla_version = None
+        self._wheel_steer_angle_reliable = True
+        # Speed unit the server samples steering_curve in (see set_carla_version).
+        self._steering_curve_speed_scale = MPS_TO_KMH
+        self.timestamp = None
+        self.ego_actor = None
+        self.physics_control = None
+        # Map origin (CARLA->map offset) is resolved once the world/map is
+        # loaded (on_world_ready); None until then. An initialpose that arrives
+        # before that is buffered here and applied on_world_ready.
+        self._map_origin = None
+        self._pending_initialpose = None
+        # Per-actor constants for ground truth objects: (label, dimensions), None for non-vehicles
+        self.ground_truth_world = None
+        self.ground_truth_tick_id = None
+        self.ground_truth_static = {}
+        self.current_control = carla.VehicleControl()
+        # Until a gear command arrives the bridge keeps reporting DRIVE, which
+        # is what it did unconditionally before gear commands were handled.
+        self.current_gear = GearCommand.DRIVE
+        self.current_turn_indicator = TurnIndicatorsCommand.DISABLE
+        self.current_hazard_lights = HazardLightsCommand.DISABLE
+
+        # Thread synchronization (protects: current_control, ego_actor, timestamp, physics_control)
+        self._state_lock = threading.Lock()
+
+        # Per-sensor publish workers keyed by sensor ID. Heavy sensor data
+        # (camera, lidar) is converted and published on these threads so the
+        # synchronous tick loop is never blocked by serialization or by
+        # reliable-QoS flow control (see SensorPublishWorker).
+        self._publish_workers = {}
+
+        # ROS-related helpers initialized later
+        self.ros2_node = None
+        self.ros_publisher_manager = None
+        self.clock_publisher = None
+        self.spin_thread = None
+        self.cv_bridge = CvBridge()
+
+    def __call__(self):
+        input_data = self.sensor_interface.get_data(GameTime.get_frame())
+        timestamp = GameTime.get_time()
+        control = self.run_step(input_data, timestamp)
+        return control
+
+    def get_param(self):
+        return self.param_values
+
+    def checkFrequency(self, sensor, timestamp=None):
+        """
+        Return True when publication should be throttled for the sensor.
+
+        Uses simulation time for all sensors to ensure correct throttling in
+        synchronous mode. Wall-clock timing would cause issues when simulation speed differs from
+        real-time. timestamp defaults to the latest tick time; callers publishing a measurement
+        pass the time of the frame it was captured on, so the throttle measures the interval
+        between captures rather than between the ticks that happened to deliver them.
+
+        """
+        # Use sensor registry for all sensors (including legacy ones)
+        config = self.sensor_registry.get_sensor(sensor)
+        if not config:
+            return False
+
+        if timestamp is None:
+            timestamp = self.timestamp
+        if timestamp is None:
+            return False
+
+        should_publish = self.sensor_registry.should_publish(sensor, timestamp)
+        return not should_publish
+
+    def get_msg_header(self, frame_id, timestamp=None):
+        """Obtain and modify ROS message header.
+
+        timestamp defaults to the latest tick time; publish workers pass the
+        timestamp captured when their frame was enqueued so messages are
+        stamped with the frame's own tick even when published later.
+        """
+        header = Header()
+        header.frame_id = frame_id
+        if timestamp is None:
+            timestamp = self.timestamp
+        seconds = int(timestamp)
+        nanoseconds = int((timestamp - int(timestamp)) * 1000000000.0)
+        header.stamp = Time(sec=seconds, nanosec=nanoseconds)
+        return header
+
+    def _submit_to_publish_worker(self, key, fn, *args):
+        """Run a publish call on the sensor's worker thread (created lazily)."""
+        worker = self._publish_workers.get(key)
+        if worker is None:
+            worker = SensorPublishWorker(key, self.logger)
+            self._publish_workers[key] = worker
+        worker.submit(fn, args)
+
+    def lidar(self, carla_lidar_measurement, id_, timestamp=None):
+        """Transform the received lidar measurement into a ROS point cloud message.
+
+        Runs on the sensor's publish worker thread; frequency gating and
+        registry bookkeeping happen at the dispatch site in run_step.
+        """
+        config = self.sensor_registry.get_sensor(id_)
+        if not config:
+            self.logger.warning(f"No registry entry for LiDAR sensor '{id_}'")
+            return
+
+        publisher = self.pub_lidar.get(id_)
+        if publisher is None:
+            self.logger.warning(f"LiDAR publisher missing for '{id_}'")
+            return
+        # Skip the conversion work when nothing consumes this point cloud.
+        if publisher.get_subscription_count() == 0:
+            return
+
+        header = self.get_msg_header(frame_id=config.frame_id or "base_link", timestamp=timestamp)
+        fields = [
+            PointField(name="x", offset=0, datatype=PointField.FLOAT32, count=1),
+            PointField(name="y", offset=4, datatype=PointField.FLOAT32, count=1),
+            PointField(name="z", offset=8, datatype=PointField.FLOAT32, count=1),
+            PointField(name="intensity", offset=12, datatype=PointField.UINT8, count=1),
+            PointField(name="return_type", offset=13, datatype=PointField.UINT8, count=1),
+            PointField(name="channel", offset=14, datatype=PointField.UINT16, count=1),
+        ]
+
+        lidar_data = numpy.frombuffer(
+            carla_lidar_measurement.raw_data, dtype=numpy.float32
+        ).reshape(-1, 4)
+        intensity = lidar_data[:, 3]
+        intensity = (
+            numpy.clip(intensity, 0, 1) * 255
+        )  # CARLA lidar intensity values are between 0 and 1
+        intensity = intensity.astype(numpy.uint8).reshape(-1, 1)
+
+        return_type = numpy.zeros((lidar_data.shape[0], 1), dtype=numpy.uint8)
+        channel = numpy.empty((0, 1), dtype=numpy.uint16)
+
+        # Determine number of channels from configuration if available
+        num_channels = int(config.parameters.get("channels", 32))
+
+        for i in range(num_channels):
+            current_ring_points_count = carla_lidar_measurement.get_point_count(i)
+            channel = numpy.vstack(
+                (channel, numpy.full((current_ring_points_count, 1), i, dtype=numpy.uint16))
+            )
+
+        lidar_data = numpy.hstack((lidar_data[:, :3], intensity, return_type, channel))
+        lidar_data[:, 1] *= -1
+
+        dtype = [
+            ("x", "f4"),
+            ("y", "f4"),
+            ("z", "f4"),
+            ("intensity", "u1"),
+            ("return_type", "u1"),
+            ("channel", "u2"),
+        ]
+
+        structured_lidar_data = numpy.zeros(lidar_data.shape[0], dtype=dtype)
+        structured_lidar_data["x"] = lidar_data[:, 0]
+        structured_lidar_data["y"] = lidar_data[:, 1]
+        structured_lidar_data["z"] = lidar_data[:, 2]
+        structured_lidar_data["intensity"] = lidar_data[:, 3].astype(numpy.uint8)
+        structured_lidar_data["return_type"] = lidar_data[:, 4].astype(numpy.uint8)
+        structured_lidar_data["channel"] = lidar_data[:, 5].astype(numpy.uint16)
+
+        point_cloud_msg = create_cloud(header, fields, structured_lidar_data)
+        publisher.publish(point_cloud_msg)
+
+    def _project_initialpose_to_ground(self, carla_pose_transform):
+        """Return the CARLA ground height under the pose, or None to skip snapping.
+
+        Returns None when spawn_point_ground_snap is disabled, or when no ground
+        height can be found (older CARLA APIs without ``ground_projection``, or
+        no ground hit), so callers fall back to the fixed z-offset.
+        """
+        if not self.param_values["spawn_point_ground_snap"]:
+            return None
+
+        return project_point_to_ground(
+            CarlaDataProvider.get_world(),
+            carla_pose_transform.location.x,
+            carla_pose_transform.location.y,
+        )
+
+    def _current_map_origin(self):
+        """Return the resolved CARLA→map offset, or (0, 0) if not yet resolved."""
+        return self._map_origin if self._map_origin is not None else (0.0, 0.0)
+
+    def _derive_map_origin(self):
+        """Compute the CARLA→map-frame origin offset from the loaded map.
+
+        Must only be called once the CARLA world/map is fully loaded (see
+        :meth:`on_world_ready`); it reads ``get_map()`` directly with no
+        readiness guards, since resolving against a not-yet-loaded (e.g. default)
+        map would silently latch the wrong origin.
+
+        An explicit non-zero ``map_origin_x/y`` parameter always wins.  When the
+        parameters are left at 0/0 and the CARLA map carries a georeferenced
+        OpenDRIVE ``<geoReference>`` (+lat_0/+lon_0 other than 0/0, e.g. maps
+        converted from lanelet2), derive the offset as the origin's in-cell MGRS
+        coordinates.  Hand-maintained constants for such maps can silently
+        disagree with the geoReference by sub-metre amounts, shifting the GNSS
+        pose and RViz initialpose against everything else that derives its
+        offset from the map itself.  Stock CARLA towns (no usable geoReference)
+        keep the plain 0/0 behavior.
+        """
+        px = float(self.param_values["map_origin_x"])
+        py = float(self.param_values["map_origin_y"])
+        if px != 0.0 or py != 0.0:
+            return px, py
+        try:
+            xodr_xml = CarlaDataProvider.get_world().get_map().to_opendrive()
+            lat_0, lon_0 = _parse_geo_reference(xodr_xml)
+        except (RuntimeError, ValueError):
+            return 0.0, 0.0
+        if lat_0 == 0.0 and lon_0 == 0.0:
+            return 0.0, 0.0
+        from autoware_lanelet2_extension_python.projection import MGRSProjector
+        import lanelet2.core
+        import lanelet2.io
+
+        projector = MGRSProjector(lanelet2.io.Origin(lat_0, lon_0))
+        local = projector.forward(lanelet2.core.GPSPoint(lat_0, lon_0, 0.0))
+        self.logger.info(
+            f"map origin derived from OpenDRIVE geoReference: "
+            f"lat_0={lat_0:.8f}, lon_0={lon_0:.8f} -> "
+            f"offset=({local.x:.3f}, {local.y:.3f})"
+        )
+        return float(local.x), float(local.y)
+
+    def on_world_ready(self):
+        """Resolve the map origin once and flush any buffered initial pose.
+
+        Called by the orchestrator after the CARLA world/map is fully loaded and
+        the ego has been spawned.  Resolving here rather than lazily in the
+        callbacks means the origin always derives from the final map, and an
+        initialpose that arrived during startup is applied now instead of being
+        transformed with a not-yet-known origin.
+        """
+        origin = self._derive_map_origin()  # reads CARLA; do it outside the lock
+        with self._state_lock:
+            self._map_origin = origin
+            pending = self._pending_initialpose
+            self._pending_initialpose = None
+        self.logger.info(f"map origin resolved: ({origin[0]:.3f}, {origin[1]:.3f})")
+        if pending is not None:
+            self.logger.info("Applying the initial pose buffered during startup")
+            self._apply_initialpose(pending)
+
+    def initialpose_callback(self, data):
+        """Buffer or apply an RViz initial pose (thread-safe).
+
+        A map-frame pose can only be converted to CARLA once the map origin is
+        known.  If it is not resolved yet (on_world_ready has not run), buffer
+        the latest pose and apply it then; otherwise apply immediately.
+        """
+        with self._state_lock:
+            ready = self._map_origin is not None
+            if not ready:
+                self._pending_initialpose = data
+        if not ready:
+            self.logger.info("Buffered initial pose until the CARLA world/map is ready")
+            return
+        self._apply_initialpose(data)
+
+    def _apply_initialpose(self, data):
+        """Convert a map-frame initial pose to CARLA and teleport the ego."""
+        pose = data.pose.pose
+        origin_x, origin_y = self._current_map_origin()
+        carla_pose_transform = ros_pose_to_carla_transform(
+            pose,
+            origin_x=origin_x,
+            origin_y=origin_y,
+        )
+        # The clicked pose is base_link; the actor origin sits wheelbase/2 ahead of it.
+        location = carla.Location(x=self.sensor_loader.wheelbase / 2.0)
+        carla_pose_transform.transform(location)
+        carla_pose_transform.location = location
+
+        # RViz's 2D Pose Estimate only carries x/y/yaw (z is always 0), so the
+        # map-frame z is meaningless here. When spawn_point_ground_snap is
+        # enabled and CARLA exposes ground_projection, snap onto the map
+        # geometry; otherwise fall back to the fixed +2.0 z-offset that has
+        # always been applied.
+        ground_z = self._project_initialpose_to_ground(carla_pose_transform)
+        if ground_z is not None:
+            carla_pose_transform.location.z = (
+                ground_z + self.param_values["initial_pose_ground_offset_z"]
+            )
+            self.logger.info(
+                "Ground-snapped initial pose: "
+                f"ground_z={ground_z:.3f}, "
+                f"offset_z={self.param_values['initial_pose_ground_offset_z']:.3f}, "
+                f"pose_z={carla_pose_transform.location.z:.3f}"
+            )
+        else:
+            carla_pose_transform.location.z += 2.0
+
+        with self._state_lock:
+            if self.ego_actor is not None:
+                self.ego_actor.set_transform(carla_pose_transform)
+            else:
+                self.logger.warning("Cannot set initial pose: ego vehicle not available")
+
+    def _ego_base_link_transform(self):
+        """Return the ego transform at base_link (rear axle), wheelbase/2 behind the origin."""
+        transform = self.ego_actor.get_transform()
+        location = carla.Location(x=-self.sensor_loader.wheelbase / 2.0)
+        transform.transform(location)
+        return carla.Transform(location, transform.rotation)
+
+    def pose(self):
+        """Transform odometry data to Pose and publish with covariance (thread-safe)."""
+        if self.checkFrequency("pose"):
+            return
+
+        # Get GNSS sensor configuration from registry (fallback to "pose" pseudo-sensor)
+        gnss_config = self.sensor_registry.get_sensor("gnss") or self.sensor_registry.get_sensor(
+            "pose"
+        )
+
+        if not gnss_config or not gnss_config.publisher:
+            self.logger.warning(
+                "GNSS/pose publisher not initialized in registry. "
+                "Check sensor_mapping.yaml includes gnss_link sensor."
+            )
+            return
+
+        header = self.get_msg_header(frame_id="map")
+        out_pose_with_cov = PoseWithCovarianceStamped()
+        pose_carla = Pose()
+
+        # Thread-safe access to ego_actor
+        with self._state_lock:
+            if not self.ego_actor:
+                return
+            ego_transform = self._ego_base_link_transform()
+
+        origin_x, origin_y = self._current_map_origin()
+        pose_carla.position = carla_location_to_ros_point(
+            ego_transform.location,
+            origin_x=origin_x,
+            origin_y=origin_y,
+        )
+        pose_carla.orientation = carla_rotation_to_ros_quaternion(ego_transform.rotation)
+        out_pose_with_cov.header = header
+        out_pose_with_cov.pose.pose = pose_carla
+        out_pose_with_cov.pose.covariance = self._create_gnss_covariance_matrix()
+
+        # Publish via registry publisher
+        gnss_config.publisher.publish(out_pose_with_cov)
+        self.sensor_registry.update_sensor_timestamp(gnss_config.sensor_id, self.timestamp)
+
+    def _create_gnss_covariance_matrix(self):
+        """Create GNSS covariance matrix from sensor configuration."""
+        cfg = self.sensor_registry.get_sensor("gnss")
+        if cfg:
+            cov = getattr(cfg, "covariance", {})
+        else:
+            cov = {}
+        pos_var = cov.get("position_variance", 0.01)
+        orient_var = cov.get("orientation_variance", 1.0)
+        return [
+            pos_var,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            pos_var,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            pos_var,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            orient_var,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            orient_var,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            orient_var,
+        ]
+
+    def _build_camera_info(self, camera_actor):
+        """Build camera info message from CARLA camera actor."""
+        camera_info = CameraInfo()
+        camera_info.width = camera_actor.width
+        camera_info.height = camera_actor.height
+        camera_info.distortion_model = "plumb_bob"
+        cx = camera_info.width / 2.0
+        cy = camera_info.height / 2.0
+        fx = camera_info.width / (2.0 * math.tan(camera_actor.fov * math.pi / 360.0))
+        fy = fx
+        camera_info.k = [fx, 0.0, cx, 0.0, fy, cy, 0.0, 0.0, 1.0]
+        camera_info.d = [0.0, 0.0, 0.0, 0.0, 0.0]
+        camera_info.r = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+        camera_info.p = [fx, 0.0, cx, 0.0, 0.0, fy, cy, 0.0, 0.0, 0.0, 1.0, 0.0]
+
+        return camera_info
+
+    def camera(self, carla_camera_data, cam_id, timestamp=None):
+        """Handle multiple cameras with dynamic routing by sensor ID.
+
+        Runs on the sensor's publish worker thread; frequency gating and
+        registry bookkeeping happen at the dispatch site in run_step.
+        """
+        config = self.sensor_registry.get_sensor(cam_id)
+        if not config:
+            self.logger.warning(f"No registry entry for camera '{cam_id}'")
+            return
+
+        # Converting and publishing a multi-megabyte image is expensive even
+        # off the tick thread (GIL pressure from several workers starves it).
+        # Skip the work entirely when nothing consumes this camera; checked
+        # per frame so late subscribers start receiving immediately.
+        img_pub = self.pub_camera.get(cam_id)
+        info_pub = self.pub_camera_info.get(cam_id)
+        has_image_subs = img_pub is not None and img_pub.get_subscription_count() > 0
+        has_info_subs = info_pub is not None and info_pub.get_subscription_count() > 0
+        if not has_image_subs and not has_info_subs:
+            return
+
+        if cam_id not in self.camera_info_cache:
+            self.camera_info_cache[cam_id] = self._build_camera_info(carla_camera_data)
+
+        header = self.get_msg_header(
+            frame_id=config.frame_id or f"{cam_id}/camera_optical_link", timestamp=timestamp
+        )
+
+        # Publish camera info
+        if has_info_subs:
+            cam_info = self.camera_info_cache[cam_id]
+            cam_info.header = header
+            info_pub.publish(cam_info)
+
+        # Publish image
+        if has_image_subs:
+            img_msg = self._build_image_msg(carla_camera_data, config.image_encoding)
+            img_msg.header = header
+            img_pub.publish(img_msg)
+
+    def _build_image_msg(self, carla_camera_data, encoding):
+        """Convert a CARLA camera frame into a ROS image message.
+
+        CARLA renders BGRA. Converting to mono8 here rather than in the
+        consumer keeps three of every four bytes off the wire, and a consumer
+        that wants luminance was going to do this conversion anyway.
+
+        bgr8 drops only the alpha channel, which CARLA fills with 255 and no
+        consumer reads: a quarter of the bytes for none of the information.
+        """
+        image_array = numpy.ndarray(
+            shape=(carla_camera_data.height, carla_camera_data.width, 4),
+            dtype=numpy.uint8,
+            buffer=carla_camera_data.raw_data,
+        )
+        if encoding == "mono8":
+            image_array = cv2.cvtColor(image_array, cv2.COLOR_BGRA2GRAY)
+        elif encoding == "bgr8":
+            image_array = image_array[:, :, :3]
+        return self.cv_bridge.cv2_to_imgmsg(image_array, encoding=encoding)
+
+    def imu(self, carla_imu_measurement, timestamp=None):
+        """Transform and publish IMU measurement to ROS."""
+        if self.checkFrequency("imu", timestamp):
+            return
+
+        config = self.sensor_registry.get_sensor("imu")
+        if not config:
+            self.logger.warning("No registry entry for IMU sensor")
+            return
+
+        imu_msg = Imu()
+        imu_msg.header = self.get_msg_header(
+            frame_id=config.frame_id or "imu_link", timestamp=timestamp
+        )
+        imu_msg.angular_velocity.x = -carla_imu_measurement.gyroscope.x
+        imu_msg.angular_velocity.y = carla_imu_measurement.gyroscope.y
+        imu_msg.angular_velocity.z = -carla_imu_measurement.gyroscope.z
+
+        imu_msg.linear_acceleration.x = carla_imu_measurement.accelerometer.x
+        imu_msg.linear_acceleration.y = -carla_imu_measurement.accelerometer.y
+        imu_msg.linear_acceleration.z = carla_imu_measurement.accelerometer.z
+
+        roll = math.radians(carla_imu_measurement.transform.rotation.roll)
+        pitch = -math.radians(carla_imu_measurement.transform.rotation.pitch)
+        yaw = -math.radians(carla_imu_measurement.transform.rotation.yaw)
+
+        quat = euler2quat(roll, pitch, yaw)
+        imu_msg.orientation.w = quat[0]
+        imu_msg.orientation.x = quat[1]
+        imu_msg.orientation.y = quat[2]
+        imu_msg.orientation.z = quat[3]
+
+        if self.pub_imu:
+            self.pub_imu.publish(imu_msg)
+            self.sensor_registry.update_sensor_timestamp(
+                "imu", self.timestamp if timestamp is None else timestamp
+            )
+        else:
+            self.logger.warning("IMU publisher not initialized")
+
+    def first_order_steering(self, steer_input):
+        """
+        First order steering model.
+
+        Gracefully handles:
+        - Early control commands before first simulation tick (returns raw input)
+        - Multiple commands in same CARLA tick (preserves filter state, no zero spike)
+
+        """
+        # Guard against control commands arriving before first sensor callback
+        if self.timestamp is None:
+            return steer_input  # No filtering yet, return raw command
+
+        # Initialize on first call
+        if self.prev_timestamp is None:
+            self.prev_timestamp = self.timestamp
+            self.prev_steer_output = steer_input
+            return steer_input
+
+        dt = self.timestamp - self.prev_timestamp
+
+        # Multiple commands in same simulation tick (dt = 0)
+        # Preserve filter state to avoid zero spike - return previous output
+        if dt <= 0.0:
+            return self.prev_steer_output
+
+        # Normal case: time has advanced, apply low-pass filter
+        steer_output = self.prev_steer_output + (steer_input - self.prev_steer_output) * (
+            dt / (self.tau + dt)
+        )
+        self.prev_steer_output = steer_output
+        self.prev_timestamp = self.timestamp
+        return steer_output
+
+    def _ego_speed_mps(self):
+        """Return the ego speed in m/s (needs _state_lock held)."""
+        velocity = self.ego_actor.get_velocity()
+        return math.sqrt(
+            velocity.x * velocity.x + velocity.y * velocity.y + velocity.z * velocity.z
+        )
+
+    def _apply_min_positive_throttle(self, out_cmd, in_cmd):
+        """Enforce the standstill throttle floor on out_cmd (needs _state_lock held).
+
+        Heavy CARLA vehicles do not creep and never start moving on the small
+        throttle the actuation map yields at low target accelerations, so
+        while accelerating from (near) standstill the commanded throttle is
+        raised to at least min_positive_throttle. Disabled by default (0.0).
+        """
+        min_positive_throttle = self.param_values.get("min_positive_throttle", 0.0)
+        if min_positive_throttle <= 0.0 or out_cmd.throttle <= 0.0:
+            return
+        if in_cmd.actuation.brake_cmd > 0.0:
+            return
+        speed_threshold = self.param_values.get("min_positive_throttle_speed_threshold", 0.8)
+        if speed_threshold >= 0.0 and self._ego_speed_mps() > speed_threshold:
+            return
+        out_cmd.throttle = max(out_cmd.throttle, min_positive_throttle)
+
+    def _wake_sleeping_physics(self, out_cmd, in_cmd):
+        """Wake the ego physics body when pulling away from a standstill.
+
+        CARLA 0.10 (UE5/Chaos) puts a stationary vehicle's physics body to
+        sleep, and VehicleControl throttle does NOT wake it, so a vehicle that
+        has been stopped for a while can never launch again (observed: throttle
+        applied, brake 0, first gear — velocity stays exactly 0 until an
+        external set_target_velocity kick wakes the body). Nudge the body awake
+        whenever the stack is trying to pull away from a standstill; once
+        rolling (speed > 0.05 m/s) this no-ops. Needs ``_state_lock`` held.
+
+        Gated behind ``wake_sleeping_physics`` (off by default): the kick
+        overrides launch dynamics at every standstill start, so it must not run
+        on the supported CARLA 0.9.15 environment, whose bodies never sleep.
+        """
+        if not self.param_values.get("wake_sleeping_physics", False):
+            return
+        if out_cmd.throttle <= 0.0 or in_cmd.actuation.brake_cmd > 0.0:
+            return
+        if self._ego_speed_mps() >= 0.05:
+            return
+        wake_yaw = math.radians(self.ego_actor.get_transform().rotation.yaw)
+        self.ego_actor.set_target_velocity(
+            carla.Vector3D(0.3 * math.cos(wake_yaw), 0.3 * math.sin(wake_yaw), 0.0)
+        )
+
+    def control_callback(self, in_cmd):
+        """
+        Convert and publish CARLA Ego Vehicle Control to AUTOWARE.
+
+        Thread-safe: Acquires state lock when accessing shared vehicle state.
+
+        """
+        out_cmd = carla.VehicleControl()
+        out_cmd.throttle = in_cmd.actuation.accel_cmd
+        # Keep the vehicle in first gear with manual shifting so heavy vehicles
+        # respond to throttle immediately instead of idling in neutral.
+        out_cmd.gear = 1
+        out_cmd.manual_gear_shift = True
+
+        with self._state_lock:
+            # convert base on steer curve of the vehicle
+            if not self.physics_control or not self.ego_actor:
+                return  # Skip if vehicle not initialized yet
+
+            self._apply_min_positive_throttle(out_cmd, in_cmd)
+            self._wake_sleeping_physics(out_cmd, in_cmd)
+
+            # steer_cmd is a tire angle in radians (raw_vehicle_cmd_converter
+            # passes control_cmd.steering_tire_angle through), while
+            # VehicleControl.steer expects a fraction of the wheel's max steer
+            # angle in [-1, 1]. Normalize by the max wheel angle; the sign flips
+            # because Autoware is CCW-positive and CARLA CW-positive.
+            # NOTE: no steering_curve multiplication here — the simulator applies
+            # its speed-based steering limit internally, and CARLA 0.10 returns
+            # corrupt curve data (duplicated/unsorted points) anyway.
+            steer_norm = -in_cmd.actuation.steer_cmd / self._max_wheel_steer_angle_rad()
+            steer_norm = max(-1.0, min(1.0, steer_norm))
+            out_cmd.steer = self.first_order_steering(steer_norm)
+            out_cmd.brake = in_cmd.actuation.brake_cmd
+            self._apply_gear(out_cmd, self.current_gear)
+            self.current_control = out_cmd
+
+    def _physics_max_wheel_steer_angle_rad(self):
+        """Max steerable wheel angle [rad] reported by the vehicle physics.
+
+        This is CARLA's own full-steer angle: normalized VehicleControl.steer
+        in [-1, 1] maps to +/- this angle, and ``get_wheel_steer_angle()``
+        returns a value on the same scale. Must be called with
+        ``physics_control`` already available.
+        """
+        if self._physics_max_steer_angle_rad is None:
+            max_deg = max((w.max_steer_angle for w in self.physics_control.wheels), default=0.0)
+            if max_deg <= 0.0:
+                max_deg = 70.0  # CARLA's usual front-wheel default
+            self._physics_max_steer_angle_rad = math.radians(max_deg)
+        return self._physics_max_steer_angle_rad
+
+    def _max_wheel_steer_angle_rad(self):
+        """Calibrated full-steer wheel angle [rad] used for steer conversion.
+
+        Uses ``max_wheel_steer_angle_deg`` when set (> 0), otherwise the
+        physics value. Must be called with ``physics_control`` available.
+        """
+        if self._max_steer_angle_rad is None:
+            max_deg = float(self.param_values.get("max_wheel_steer_angle_deg", 0.0))
+            if max_deg <= 0.0:
+                self._max_steer_angle_rad = self._physics_max_wheel_steer_angle_rad()
+            else:
+                self._max_steer_angle_rad = math.radians(max_deg)
+        return self._max_steer_angle_rad
+
+    def _steer_report_scale(self):
+        """Factor mapping CARLA's reported wheel angle to the calibrated angle.
+
+        ``get_wheel_steer_angle()`` returns an angle on the physics full-steer
+        scale, but the command path normalizes by the (possibly overridden)
+        calibrated angle. Scaling the report by calibrated / physics keeps the
+        steering feedback consistent with the command, so the ~3x report
+        mismatch the override removes on the command side is removed here too.
+        """
+        physics_rad = self._physics_max_wheel_steer_angle_rad()
+        if physics_rad <= 0.0:
+            return 1.0
+        return self._max_wheel_steer_angle_rad() / physics_rad
+
+    def set_carla_version(self, version_str):
+        """Record the CARLA server version and derive capability flags from it.
+
+        CARLA 0.10 (Chaos physics) always returns 0 from
+        get_wheel_steer_angle(), so on 0.10+ the steering report is synthesized
+        from the applied control while 0.9.x keeps using the measured wheel
+        angle. An unparsable version keeps the 0.9.x (measured) behavior.
+        https://carla.readthedocs.io/en/latest/python_api/#carla.Actor.get_wheel_steer_angle
+        """
+        import re
+
+        self.carla_version = version_str
+        match = re.match(r"\s*(\d+)\.(\d+)", version_str or "")
+        if match is None:
+            self.logger.warning(
+                f"Could not parse CARLA version '{version_str}'; assuming "
+                "get_wheel_steer_angle() is reliable (CARLA 0.9.x behavior)."
+            )
+            self._wheel_steer_angle_reliable = True
+            return
+        major, minor = int(match.group(1)), int(match.group(2))
+        self._wheel_steer_angle_reliable = (major, minor) < (0, 10)
+        # steering_curve is sampled against the forward speed in the unit the
+        # underlying UE vehicle plugin uses: mph for Chaos (CARLA 0.10+ / UE5),
+        # km/h for PhysX (CARLA 0.9.x / UE4).
+        self._steering_curve_speed_scale = (
+            MPS_TO_KMH if self._wheel_steer_angle_reliable else MPS_TO_MPH
+        )
+        self.logger.info(
+            f"CARLA server version {version_str}: "
+            f"wheel steer angle "
+            f"{'reliable' if self._wheel_steer_angle_reliable else 'synthesized'}."
+        )
+
+    def _steering_curve_factor(self, speed_mps):
+        """Steering multiplier CARLA applies at ``speed_mps`` [m/s] forward speed.
+
+        CARLA scales the achievable wheel angle by the vehicle's
+        ``steering_curve`` (a forward-speed -> [0, 1] factor lookup) before
+        turning the wheels, so the synthesized steering report folds in the same
+        factor to match the angle the simulator actually produced. Returns 1.0
+        when no curve is available or when the curve has been flattened to the
+        identity curve via flatten_steering_curve.
+
+        The curve's speed axis is NOT in m/s: the UE vehicle plugin evaluates it
+        against the forward speed in mph on Chaos (CARLA 0.10+, the versions this
+        synthesized report runs on) and in km/h on PhysX (CARLA 0.9.x), so the
+        speed is converted with the scale set by set_carla_version() before
+        interpolating. Sampling the curve with a raw m/s value would read it at
+        roughly 1/2 (mph) or 1/4 (km/h) of the real speed and overstate the
+        factor wherever the curve attenuates steering.
+        https://carla.readthedocs.io/en/latest/python_api/#carlavehiclephysicscontrol
+        """
+        curve = getattr(self.physics_control, "steering_curve", None)
+        if not curve:
+            return 1.0
+        # CARLA 0.10 ships corrupt curves (duplicated, unsorted points); sort by
+        # speed so numpy.interp stays monotonic. numpy.interp clamps to the end
+        # point factors outside the sampled speed range.
+        points = sorted(((p.x, p.y) for p in curve), key=lambda point: point[0])
+        speeds = [point[0] for point in points]
+        factors = [point[1] for point in points]
+        curve_speed = abs(speed_mps) * self._steering_curve_speed_scale
+        return float(numpy.interp(curve_speed, speeds, factors))
+
+    @staticmethod
+    def _apply_gear(control, gear):
+        """Apply the selected gear to a CARLA control command.
+
+        CARLA has no gear selector of its own for the throttle direction: it
+        carries a reverse flag and a gear number, and the control built here
+        shifts manually, where the gear number is what decides the direction.
+        CARLA's own manual_control example keeps the two in step, setting
+        `gear = 1 if reverse else -1` and reading the flag back as
+        `reverse = gear < 0`, so both are set here rather than the flag alone.
+        Setting them together also matters for the standing control, which
+        keeps driving the vehicle until the next actuation command replaces it:
+        leaving a stale reverse gear on it would back the vehicle up for a
+        cycle after the shift out of REVERSE.
+
+        In a gear the vehicle cannot pull away in, the accelerator is ignored
+        and the brake is held instead, so the bridge never drives forward while
+        reporting PARK or NEUTRAL.
+        """
+        control.reverse = gear in REVERSE_GEARS
+        control.gear = -1 if control.reverse else 1
+        if gear in STANDSTILL_GEARS:
+            control.throttle = 0.0
+            control.brake = 1.0
+
+    def gear_callback(self, in_cmd):
+        """Store gear command and apply it to the standing control (thread-safe)."""
+        with self._state_lock:
+            self.current_gear = in_cmd.command
+            # A gear command can arrive between two actuation commands, and the
+            # vehicle keeps being driven by the control built for the previous
+            # one until the next arrives.
+            self._apply_gear(self.current_control, self.current_gear)
+
+    def turn_indicators_callback(self, in_cmd):
+        """Store turn indicator command (thread-safe)."""
+        with self._state_lock:
+            self.current_turn_indicator = in_cmd.command
+
+    def hazard_lights_callback(self, in_cmd):
+        """Store hazard lights command (thread-safe)."""
+        with self._state_lock:
+            self.current_hazard_lights = in_cmd.command
+
+    def apply_light_state(self):
+        """
+        Apply turn indicator and hazard lights commands to CARLA ego vehicle.
+
+        Hazard takes priority over turn indicator. Other light bits (brake,
+        reverse, headlights, etc.) are preserved so we do not interfere with
+        anything CARLA or another module manages.
+
+        """
+        with self._state_lock:
+            if not self.ego_actor:
+                return
+            turn_cmd = self.current_turn_indicator
+            hazard_cmd = self.current_hazard_lights
+            current_state = int(self.ego_actor.get_light_state())
+
+            left_bit = int(carla.VehicleLightState.LeftBlinker)
+            right_bit = int(carla.VehicleLightState.RightBlinker)
+
+            new_state = current_state & ~left_bit & ~right_bit
+            if hazard_cmd == HazardLightsCommand.ENABLE:
+                new_state |= left_bit | right_bit
+            elif turn_cmd == TurnIndicatorsCommand.ENABLE_LEFT:
+                new_state |= left_bit
+            elif turn_cmd == TurnIndicatorsCommand.ENABLE_RIGHT:
+                new_state |= right_bit
+
+            # typesafe_carla's VehicleLightState is an IntEnum whose members are
+            # single flags: a combination is not a member, so pass the int.
+            self.ego_actor.set_light_state(new_state)
+
+    def _read_ego_state(self):
+        """Read one consistent ego snapshot under the state lock, or None if no ego actor."""
+        with self._state_lock:
+            if not self.ego_actor:
+                return None
+            return EgoState(
+                transform=self.ego_actor.get_transform(),
+                velocity=self.ego_actor.get_velocity(),
+                angular_velocity=self.ego_actor.get_angular_velocity(),
+                steer_angle=self.ego_actor.get_wheel_steer_angle(
+                    carla.VehicleWheelLocation.FL_Wheel
+                ),
+                control=self.ego_actor.get_control(),
+                light_state=int(self.ego_actor.get_light_state()),
+                gear=self.current_gear,
+            )
+
+    @staticmethod
+    def _velocity_in_ego_frame(ego_transform, ego_velocity_carla):
+        """Rotate the CARLA world-frame velocity into the ego (base_link) frame."""
+        trans_mat = numpy.array(ego_transform.get_matrix()).reshape(4, 4)
+        inv_rot_mat = trans_mat[0:3, 0:3].T
+        vel_vec = numpy.array(
+            [ego_velocity_carla.x, ego_velocity_carla.y, ego_velocity_carla.z]
+        ).reshape(3, 1)
+        return (inv_rot_mat @ vel_vec).T[0]
+
+    def _steering_tire_angle(self, ego, speed_mps):
+        """Return the steering tire angle [rad] to report for this simulation step.
+
+        CARLA 0.10 (Chaos) always reports 0 from get_wheel_steer_angle(), so on
+        0.10+ (see set_carla_version) the angle is synthesized from the applied
+        control; 0.9.x keeps using the measured wheel angle.
+        """
+        if self._wheel_steer_angle_reliable:
+            # Scale CARLA's reported wheel angle onto the calibrated full-steer
+            # range so the feedback matches the command normalization (identity
+            # when max_wheel_steer_angle_deg is unset). The sign flips because
+            # Autoware is CCW-positive and CARLA CW-positive.
+            return -math.radians(ego.steer_angle) * self._steer_report_scale()
+        if self.physics_control is None:
+            return 0.0
+        # get_control().steer is the requested steer fraction BEFORE the server
+        # applies the vehicle's speed-based steering_curve, so the bare fraction
+        # * max angle overstates the wheel angle whenever the curve attenuates
+        # steering at speed. Fold the same curve back in so the report matches
+        # the angle CARLA actually produced. control_callback intentionally
+        # leaves the curve to the server, and flatten_steering_curve makes this
+        # factor ~1.0 (identity curve), leaving the report unchanged.
+        curve_factor = self._steering_curve_factor(speed_mps)
+        return -ego.control.steer * self._max_wheel_steer_angle_rad() * curve_factor
+
+    @staticmethod
+    def _blinker_reports(light_state, stamp):
+        """Decode CARLA blinker bits into Autoware turn-indicator / hazard reports."""
+        left_on = bool(light_state & int(carla.VehicleLightState.LeftBlinker))
+        right_on = bool(light_state & int(carla.VehicleLightState.RightBlinker))
+        # Both blinkers on => hazard mode; the turn indicator then reports DISABLE.
+        hazard_on = left_on and right_on
+
+        out_turn_indicators_state = TurnIndicatorsReport()
+        out_turn_indicators_state.stamp = stamp
+        if hazard_on:
+            out_turn_indicators_state.report = TurnIndicatorsReport.DISABLE
+        elif left_on:
+            out_turn_indicators_state.report = TurnIndicatorsReport.ENABLE_LEFT
+        elif right_on:
+            out_turn_indicators_state.report = TurnIndicatorsReport.ENABLE_RIGHT
+        else:
+            out_turn_indicators_state.report = TurnIndicatorsReport.DISABLE
+
+        out_hazard_lights_state = HazardLightsReport()
+        out_hazard_lights_state.stamp = stamp
+        out_hazard_lights_state.report = (
+            HazardLightsReport.ENABLE if hazard_on else HazardLightsReport.DISABLE
+        )
+        return out_turn_indicators_state, out_hazard_lights_state
+
+    def ego_status(self):
+        """
+        Publish ego vehicle status.
+
+        Thread-safe: Acquires state lock when accessing ego_actor.
+
+        """
+        if self.checkFrequency("status"):
+            return
+
+        ego = self._read_ego_state()
+        if ego is None:
+            return
+
+        ego_velocity = self._velocity_in_ego_frame(ego.transform, ego.velocity)
+
+        out_vel_state = VelocityReport()
+        out_vel_state.header = self.get_msg_header(frame_id="base_link")
+        out_vel_state.longitudinal_velocity = ego_velocity[0]
+        out_vel_state.lateral_velocity = ego_velocity[1]
+        # CARLA reports the angular velocity in deg/s in Unreal's left-handed
+        # (CW-positive) frame, while ROS expects rad/s CCW-positive (REP-103):
+        # https://carla.readthedocs.io/en/latest/python_api/#carla.Actor.get_angular_velocity
+        # https://www.ros.org/reps/rep-0103.html
+        out_vel_state.heading_rate = -math.radians(ego.angular_velocity.z)
+        stamp = out_vel_state.header.stamp
+
+        out_steering_state = SteeringReport()
+        out_steering_state.stamp = stamp
+        out_steering_state.steering_tire_angle = self._steering_tire_angle(ego, ego_velocity[0])
+
+        out_gear_state = GearReport()
+        out_gear_state.stamp = stamp
+        out_gear_state.report = ego.gear
+
+        out_ctrl_mode = ControlModeReport()
+        out_ctrl_mode.stamp = stamp
+        out_ctrl_mode.mode = ControlModeReport.AUTONOMOUS
+
+        out_actuation_status = ActuationStatusStamped()
+        out_actuation_status.header = self.get_msg_header(frame_id="base_link")
+        out_actuation_status.status.accel_status = ego.control.throttle
+        out_actuation_status.status.brake_status = ego.control.brake
+        out_actuation_status.status.steer_status = -ego.control.steer
+
+        out_turn_indicators_state, out_hazard_lights_state = self._blinker_reports(
+            ego.light_state, stamp
+        )
+
+        self.pub_actuation_status.publish(out_actuation_status)
+        self.pub_vel_state.publish(out_vel_state)
+        self.pub_steering_state.publish(out_steering_state)
+        self.pub_ctrl_mode.publish(out_ctrl_mode)
+        self.pub_gear_state.publish(out_gear_state)
+        self.pub_turn_indicators_state.publish(out_turn_indicators_state)
+        self.pub_hazard_lights_state.publish(out_hazard_lights_state)
+        self.sensor_registry.update_sensor_timestamp("status", self.timestamp)
+
+    def _publish_ground_truth_odometry(self):
+        """Publish /localization/kinematic_state and the map->base_link TF.
+
+        Both are derived from the CARLA ground-truth ego transform, replacing
+        the former carla_state_publisher GNSS round-trip. CARLA reports both
+        velocities in its world frame, so each is rotated into the ego body
+        frame before the CARLA-to-ROS (REP-103) conversion; the angular rate
+        additionally converts deg/s to rad/s with the axis signs used by the
+        official ros-bridge (x, -y, -z):
+        https://carla.readthedocs.io/en/latest/python_api/#carla.Actor.get_angular_velocity
+        https://www.ros.org/reps/rep-0103.html
+        https://github.com/carla-simulator/ros-bridge/blob/master/carla_common/src/carla_common/transforms.py
+
+        Before that conversion, the linear velocity is shifted wheelbase/2 back
+        with the pose, as v + omega x r.
+
+        No-op unless publish_ground_truth_localization is enabled (the
+        publishers only exist when it is).
+        """
+        if not self.param_values.get("publish_ground_truth_localization", False):
+            return
+        with self._state_lock:
+            if not self.ego_actor:
+                return
+            ego_transform = self._ego_base_link_transform()
+            ego_vel = self.ego_actor.get_velocity()
+            ego_ang_vel = self.ego_actor.get_angular_velocity()
+
+        header = self.get_msg_header(frame_id="map")
+        pose = Pose()
+        pose.position = carla_location_to_ros_point(
+            ego_transform.location,
+            origin_x=self.param_values["map_origin_x"],
+            origin_y=self.param_values["map_origin_y"],
+        )
+        pose.orientation = carla_rotation_to_ros_quaternion(ego_transform.rotation)
+
+        tf_stamped = TransformStamped()
+        tf_stamped.header = header
+        tf_stamped.child_frame_id = "base_link"
+        tf_stamped.transform.translation.x = pose.position.x
+        tf_stamped.transform.translation.y = pose.position.y
+        tf_stamped.transform.translation.z = pose.position.z
+        tf_stamped.transform.rotation = pose.orientation
+        self.pub_gt_tf.publish(TFMessage(transforms=[tf_stamped]))
+
+        odom = Odometry()
+        odom.header = header
+        odom.child_frame_id = "base_link"
+        odom.pose.pose = pose
+        trans_mat = numpy.array(ego_transform.get_matrix()).reshape(4, 4)
+        inv_rot_mat = trans_mat[0:3, 0:3].T
+        vel_vec = numpy.array([ego_vel.x, ego_vel.y, ego_vel.z]).reshape(3, 1)
+        body_vel = (inv_rot_mat @ vel_vec).T[0]
+        ang_vel_vec = numpy.array([ego_ang_vel.x, ego_ang_vel.y, ego_ang_vel.z]).reshape(3, 1)
+        body_ang_vel = (inv_rot_mat @ ang_vel_vec).T[0]
+        lever_arm = (-self.sensor_loader.wheelbase / 2.0, 0.0, 0.0)
+        body_vel += numpy.cross(numpy.radians(body_ang_vel), lever_arm)
+        odom.twist.twist.linear.x = float(body_vel[0])
+        odom.twist.twist.linear.y = float(-body_vel[1])
+        odom.twist.twist.linear.z = float(body_vel[2])
+        odom.twist.twist.angular.x = math.radians(float(body_ang_vel[0]))
+        odom.twist.twist.angular.y = -math.radians(float(body_ang_vel[1]))
+        odom.twist.twist.angular.z = -math.radians(float(body_ang_vel[2]))
+        self.pub_gt_odom.publish(odom)
+
+    def _carla_light_map_point(self, actor):
+        """Return a CARLA traffic light's head position in the Autoware map frame.
+
+        Uses the mean of the actor's light-box centres (the physical light heads,
+        ``get_light_boxes()`` reports them in world coordinates) rather than the
+        actor origin, which sits at the pole base and is offset from the heads the
+        lanelet2 map records. Falls back to the actor location if no boxes exist.
+
+        The CARLA→map offset is read via :meth:`_current_map_origin` (not the raw
+        ``map_origin_x/y`` parameters) so georeferenced maps, whose origin is
+        derived from the OpenDRIVE geoReference in ``on_world_ready`` while the
+        parameters stay at their zero default, transform the heads into the same
+        frame as the lanelet2 ``local_x/local_y`` coordinates and localization.
+        """
+        try:
+            boxes = actor.get_light_boxes()
+        except RuntimeError:
+            boxes = None
+        if boxes:
+            locations = [box.location for box in boxes]
+            carla_location = carla.Location(
+                x=sum(loc.x for loc in locations) / len(locations),
+                y=sum(loc.y for loc in locations) / len(locations),
+                z=sum(loc.z for loc in locations) / len(locations),
+            )
+        else:
+            carla_location = actor.get_location()
+        origin_x, origin_y = self._current_map_origin()
+        point = carla_location_to_ros_point(carla_location, origin_x=origin_x, origin_y=origin_y)
+        return (point.x, point.y)
+
+    def _actor_opendrive_id(self, actor):
+        try:
+            return int(actor.get_opendrive_id())
+        except (ValueError, RuntimeError):
+            return None
+
+    def _apply_id_map_override(self, override):
+        """Assign the lights whose OpenDRIVE id is pinned in the override.
+
+        Returns ``(assignments, overridden_actor_ids)``; overridden lights bypass
+        position matching entirely.
+        """
+        assignments = {}
+        overridden = set()
+        for actor in self._traffic_light_actors:
+            opendrive_id = self._actor_opendrive_id(actor)
+            if opendrive_id is not None and opendrive_id in override:
+                assignments[actor.id] = list(override[opendrive_id])
+                overridden.add(actor.id)
+        return assignments, overridden
+
+    def _match_actors_to_map(self, actors, map_path, override_count):
+        """Position-match ``actors`` against the lanelet2 map; returns assignments."""
+        map_lights = load_map_traffic_lights(map_path)
+        carla_heads = [
+            (actor.id, self._actor_opendrive_id(actor), self._carla_light_map_point(actor))
+            for actor in actors
+        ]
+        result = match_traffic_lights(
+            carla_heads,
+            map_lights,
+            distance_threshold=self.param_values["traffic_light.match_distance"],
+            ambiguity_ratio=self.param_values["traffic_light.match_ratio"],
+        )
+        self._log_traffic_light_match(map_lights, result, override_count=override_count)
+        return result.assignments
+
+    def _fallback_opendrive_groups(self, actors):
+        """Use the OpenDRIVE signal id directly as the group id (no map path)."""
+        assignments = {}
+        for actor in actors:
+            opendrive_id = self._actor_opendrive_id(actor)
+            if opendrive_id is not None:
+                assignments[actor.id] = [opendrive_id]
+        self.logger.info(
+            f"Publishing {len(assignments)} CARLA traffic lights using the OpenDRIVE "
+            f"signal id as the group id (no traffic_light.map_path set)"
+        )
+        return assignments
+
+    def _resolve_traffic_light_groups(self):
+        """Resolve each CARLA traffic light to its Autoware group id(s), once.
+
+        Traffic lights are static actors, so the world is queried and the mapping
+        built on the first publishing tick and reused afterwards. Resolution order
+        per light:
+
+        1. ``traffic_light.id_map`` override (keyed by OpenDRIVE signal id) wins; one
+           entry may pin several group ids.
+        2. Otherwise, if a lanelet2 map is provided, the light is matched to the
+           nearest map head by position; ambiguous / too-far lights are dropped and
+           reported so they can be pinned via the override instead of mis-assigned.
+        3. Otherwise (no map), the OpenDRIVE signal id is used directly as the group
+           id, matching lanelet2 maps whose regulatory-element ids preserve it.
+        """
+        world = CarlaDataProvider.get_world()
+        if world is None:
+            return
+        # typesafe_carla returns plain Actors; the traffic-light methods
+        # (get_state, get_light_boxes, get_opendrive_id) need as_traffic_light().
+        self._traffic_light_actors = [
+            light
+            for light in (
+                as_traffic_light(actor) for actor in world.get_actors().filter("*traffic_light*")
+            )
+            if light is not None
+        ]
+
+        override = parse_id_map_override(
+            self.param_values.get("traffic_light.id_map", ""),
+            on_invalid=lambda message: self.logger.warning(f"traffic_light.id_map: {message}"),
+        )
+        assignments, overridden = self._apply_id_map_override(override)
+        to_resolve = [a for a in self._traffic_light_actors if a.id not in overridden]
+
+        map_path = str(self.param_values.get("traffic_light.map_path", "") or "").strip()
+        if map_path:
+            assignments.update(self._match_actors_to_map(to_resolve, map_path, len(overridden)))
+        else:
+            assignments.update(self._fallback_opendrive_groups(to_resolve))
+
+        self._traffic_light_actor_groups = assignments
+
+    def _log_traffic_light_match(self, map_lights, result, override_count):
+        """Log a per-light match report so a human can verify or override it."""
+        from .modules.traffic_light_matcher import MatchResult
+
+        ambiguous = [e for e in result.entries if e["status"] == MatchResult.AMBIGUOUS]
+        too_far = [e for e in result.entries if e["status"] == MatchResult.TOO_FAR]
+        self.logger.info(
+            f"Traffic-light matching: {result.matched_actor_count} matched, "
+            f"{len(ambiguous)} ambiguous, {len(too_far)} too far, "
+            f"{override_count} overridden "
+            f"(map has {len(map_lights)} heads / {map_lights.group_count} groups)"
+        )
+        for entry in ambiguous:
+            self.logger.warning(
+                f"  ambiguous CARLA light (opendrive_id={entry['opendrive_id']}): nearest "
+                f"{entry['nearest']:.2f} m vs {entry['second']:.2f} m to a different signal; "
+                f"not published (pin it via traffic_light.id_map if needed)"
+            )
+        for entry in too_far:
+            self.logger.warning(
+                f"  unmatched CARLA light (opendrive_id={entry['opendrive_id']}): nearest map "
+                f"head {entry['nearest']:.2f} m away exceeds the match distance; not published"
+            )
+
+    @staticmethod
+    def _carla_state_to_autoware_element(state):
+        """Map a carla.TrafficLightState to a TrafficLightElement (color, status).
+
+        A lit lamp reports its color as SOLID_ON. CARLA's ``Off`` is a *known* state --
+        the signal is dark, e.g. at an intersection whose lights are disabled -- so it
+        is reported as SOLID_OFF rather than as a lit lamp of unknown color, and only a
+        state this bridge cannot interpret stays UNKNOWN/UNKNOWN.
+        """
+        if state == carla.TrafficLightState.Red:
+            return TrafficLightElement.RED, TrafficLightElement.SOLID_ON
+        if state == carla.TrafficLightState.Yellow:
+            return TrafficLightElement.AMBER, TrafficLightElement.SOLID_ON
+        if state == carla.TrafficLightState.Green:
+            return TrafficLightElement.GREEN, TrafficLightElement.SOLID_ON
+        if state == carla.TrafficLightState.Off:
+            return TrafficLightElement.UNKNOWN, TrafficLightElement.SOLID_OFF
+        return TrafficLightElement.UNKNOWN, TrafficLightElement.UNKNOWN
+
+    def _publish_traffic_lights(self):
+        """Publish CARLA traffic-light states as a TrafficLightGroupArray.
+
+        No-op unless traffic_light.publish is enabled (the publisher only exists
+        then). Each CARLA light is reported as a circular signal whose color and
+        status reflect the current CARLA state, published under every
+        regulatory-element (group) id it resolved to. When traffic_light.force_green
+        is set the lights are frozen green in CARLA, so this naturally publishes
+        green for all of them.
+        """
+        if self.pub_traffic_signals is None:
+            return
+        if self._traffic_light_actor_groups is None:
+            self._resolve_traffic_light_groups()
+        if not self._traffic_light_actor_groups:
+            return
+
+        # Aggregate by group id: several physical heads (actors) can belong to the
+        # same regulatory element, and they show the same aspect, so one element per
+        # group is emitted.
+        group_elements = {}
+        for actor in self._traffic_light_actors:
+            group_ids = self._traffic_light_actor_groups.get(actor.id)
+            if not group_ids:
+                continue
+            color, status = self._carla_state_to_autoware_element(actor.get_state())
+            for group_id in group_ids:
+                group_elements[group_id] = (color, status)
+
+        msg = TrafficLightGroupArray()
+        msg.stamp = self.get_msg_header(frame_id="map").stamp
+        for group_id, (color, status) in group_elements.items():
+            group = TrafficLightGroup()
+            group.traffic_light_group_id = group_id
+            element = TrafficLightElement()
+            element.color = color
+            element.shape = TrafficLightElement.CIRCLE
+            element.status = status
+            element.confidence = 1.0
+            group.elements.append(element)
+            msg.traffic_light_groups.append(group)
+        self.pub_traffic_signals.publish(msg)
+
+    def _frame_time(self, frame):
+        """Return the simulation time [s] of a CARLA frame.
+
+        A measurement carries the frame it was captured on, which is the frame
+        the loop is processing or, for a callback that arrived late, an earlier
+        one. Both are a whole number of steps away from the current simulation
+        time.
+        """
+        frame_delta = frame - GameTime.get_frame()
+        return self.timestamp + frame_delta * self.param_values["fixed_delta_seconds"]
+
+    def _publish_sensor_data(self, key, measurement, timestamp):
+        """Publish one sensor's data, dispatching on its sensor type.
+
+        Camera and lidar conversion/publishing run on per-sensor worker
+        threads: publishing multi-megabyte messages inline (reliable-QoS
+        camera images in particular block on DDS flow control) would stall
+        the simulation loop and slow simulation time itself. Frequency
+        gating and registry bookkeeping stay on the calling thread so the
+        registry is never accessed concurrently.
+        """
+        sensor_type = self.id_to_sensor_type_map.get(key)
+        if not sensor_type:
+            self.logger.warning(
+                f"Unknown sensor ID '{key}' received from CARLA - skipping. "
+                f"This may indicate a sensor configuration mismatch."
+            )
+            return
+
+        if sensor_type.startswith("sensor.camera"):
+            if not self.checkFrequency(key, timestamp):
+                self.sensor_registry.update_sensor_timestamp(key, timestamp)
+                self._submit_to_publish_worker(key, self.camera, measurement, key, timestamp)
+        elif sensor_type == "sensor.other.gnss":
+            self.pose()
+        elif sensor_type == "sensor.lidar.ray_cast":
+            if not self.checkFrequency(key, timestamp):
+                self.sensor_registry.update_sensor_timestamp(key, timestamp)
+                self._submit_to_publish_worker(key, self.lidar, measurement, key, timestamp)
+        elif sensor_type == "sensor.other.imu":
+            self.imu(measurement, timestamp)
+        else:
+            self.logger.debug(f"No publisher for sensor '{key}' (type={sensor_type})")
+
+    def start_ground_truth_objects(self):
+        """Register the ground truth object publisher on CARLA's tick callback."""
+        with self._state_lock:
+            ego_actor = self.ego_actor
+        if ego_actor is None:
+            return
+        self.ground_truth_world = ego_actor.get_world()
+        self.ground_truth_tick_id = self.ground_truth_world.on_tick(self.ground_truth_objects)
+        self.logger.info("Publishing ground truth objects on every CARLA tick")
+
+    def stop_ground_truth_objects(self):
+        """Unregister the tick callback, if one was registered."""
+        if self.ground_truth_tick_id is not None:
+            self.ground_truth_world.remove_on_tick(self.ground_truth_tick_id)
+            self.ground_truth_tick_id = None
+
+    def learn_ground_truth_actors(self, actor_ids):
+        """Look up the class and size of new actors; ids CARLA no longer has get None."""
+        for actor in self.ground_truth_world.get_actors(actor_ids):
+            if not actor.type_id.startswith("vehicle."):
+                self.ground_truth_static[actor.id] = None
+                continue
+            bounding_box = actor.bounding_box
+            extent = bounding_box.extent
+            # CARLA spells "Bus" with a capital letter; every other base_type is lower case
+            label = BASE_TYPE_TO_LABEL.get(
+                (actor.attributes.get("base_type") or "").lower(), ObjectClassification.CAR
+            )
+            dimensions = (float(extent.x * 2.0), float(extent.y * 2.0), float(extent.z * 2.0))
+            # The box center sits at an offset from the actor origin, in the actor frame
+            center_offset = (
+                float(bounding_box.location.x),
+                float(bounding_box.location.y),
+                float(bounding_box.location.z),
+            )
+            self.ground_truth_static[actor.id] = (label, dimensions, center_offset)
+        for actor_id in actor_ids:
+            self.ground_truth_static.setdefault(actor_id, None)
+
+    def update_ground_truth_actors(self, snapshot):
+        """Learn the actors new to this snapshot, and forget the ones that left it."""
+        present = {actor_snapshot.id for actor_snapshot in snapshot}
+        unknown = present.difference(self.ground_truth_static)
+        if unknown:
+            self.learn_ground_truth_actors(list(unknown))
+        for actor_id in set(self.ground_truth_static).difference(present):
+            del self.ground_truth_static[actor_id]
+
+    def ground_truth_detection(self, transform, label, dimensions, center_offset):
+        """Build one detection from pose, label and box; velocity is left to the tracker."""
+        obj = DetectedObject()
+        obj.existence_probability = 1.0
+
+        classification = ObjectClassification()
+        classification.label = label
+        classification.probability = 1.0
+        obj.classification.append(classification)
+
+        # Autoware puts the box around the pose, so publish the box center, not the actor origin
+        center = carla.Location(*center_offset)
+        transform.transform(center)
+        obj.kinematics.pose_with_covariance.pose.position = carla_location_to_ros_point(
+            center,
+            origin_x=self.param_values["map_origin_x"],
+            origin_y=self.param_values["map_origin_y"],
+        )
+        obj.kinematics.pose_with_covariance.pose.orientation = carla_rotation_to_ros_quaternion(
+            transform.rotation
+        )
+        obj.kinematics.orientation_availability = DetectedObjectKinematics.AVAILABLE
+        obj.kinematics.has_position_covariance = False
+        obj.kinematics.has_twist = False
+        obj.kinematics.has_twist_covariance = False
+
+        obj.shape.type = Shape.BOUNDING_BOX
+        obj.shape.dimensions.x, obj.shape.dimensions.y, obj.shape.dimensions.z = dimensions
+        return obj
+
+    def ground_truth_objects(self, snapshot):
+        """Tick callback; CARLA drops exceptions raised here, so log them instead."""
+        try:
+            self.publish_ground_truth_objects(snapshot)
+        except Exception as e:
+            self.logger.warning(f"Ground truth objects skipped: {e}", throttle_duration_sec=5.0)
+
+    def publish_ground_truth_objects(self, snapshot):
+        """Publish every CARLA vehicle except the ego as a ground truth detection."""
+        with self._state_lock:
+            ego_actor = self.ego_actor
+        if ego_actor is None:
+            return
+        ego_id = ego_actor.id
+
+        self.update_ground_truth_actors(snapshot)
+
+        # Bridge clock, not snapshot.timestamp: /clock starts at the bridge's attach, not the server's
+        msg = DetectedObjects()
+        msg.header = self.get_msg_header(frame_id="map")
+        for actor_snapshot in snapshot:
+            static = self.ground_truth_static.get(actor_snapshot.id)
+            if static is None or actor_snapshot.id == ego_id:
+                continue
+            label, dimensions, center_offset = static
+            msg.objects.append(
+                self.ground_truth_detection(
+                    actor_snapshot.get_transform(), label, dimensions, center_offset
+                )
+            )
+        self.pub_ground_truth_objects.publish(msg)
+
+    def run_step(self, input_data, timestamp):
+        """
+        Execute main simulation step for publishing sensor data and getting control commands.
+
+        Thread-safe: Acquires state lock when writing timestamp and reading current_control.
+        The timestamp must be protected because control_callback reads it (via
+        first_order_steering) to calculate dt. Without protection, the ROS callback could
+        see a partially-updated or future timestamp, yielding negative/zero dt and unstable
+        steering.
+
+        Args
+        ----
+            input_data: (sensor id, frame, measurement) tuples from CARLA
+            timestamp: Current simulation timestamp
+
+        Returns
+        -------
+            carla.VehicleControl: Current control command for the vehicle
+
+
+        """
+        # Update timestamp under lock to prevent race with control_callback
+        with self._state_lock:
+            self.timestamp = timestamp
+
+        seconds = int(self.timestamp)
+        nanoseconds = int((self.timestamp - seconds) * 1e9)
+        obj_clock = Clock()
+        obj_clock.clock = Time(sec=seconds, nanosec=nanoseconds)
+        self.clock_publisher.publish(obj_clock)
+
+        self._publish_ground_truth_odometry()
+
+        # publish data of all sensors, each stamped with the frame it was captured on
+        for key, frame, measurement in input_data:
+            self._publish_sensor_data(key, measurement, self._frame_time(frame))
+
+        # Push turn indicator / hazard lights to CARLA before reading status back.
+        self.apply_light_state()
+
+        # Publish ego vehicle status
+        self.ego_status()
+
+        # Publish CARLA traffic-light states (no-op unless enabled)
+        self._publish_traffic_lights()
+        # The ego actor exists only after the first frame
+        if self.pub_ground_truth_objects is not None and self.ground_truth_tick_id is None:
+            self.start_ground_truth_objects()
+
+        # Thread-safe read of current control command
+        with self._state_lock:
+            return self.current_control
+
+    def shutdown(self):
+        """
+        Clean shutdown of ROS node and spin thread.
+
+        Properly destroys publishers, stops the spin thread, and shuts down rclpy to prevent
+        process hanging and publisher leaks.
+
+        """
+        # Stop the tick callback before destroying the publisher it writes to
+        self.stop_ground_truth_objects()
+
+        # Stop publish workers before destroying the publishers they use
+        for worker in self._publish_workers.values():
+            worker.stop()
+        self._publish_workers.clear()
+
+        # Destroy publishers first
+        if self.ros_publisher_manager:
+            self.ros_publisher_manager.destroy_all_publishers()
+
+        # Destroy node (this will stop rclpy.spin in the thread)
+        if self.ros2_node:
+            self.ros2_node.destroy_node()
+
+        # Wait for spin thread to finish (with timeout to prevent hanging)
+        if self.spin_thread and self.spin_thread.is_alive():
+            self.spin_thread.join(timeout=2.0)
+            if self.spin_thread.is_alive():
+                self.logger.warning("Spin thread did not terminate within timeout")
+
+        # Shutdown rclpy context
+        try:
+            if rclpy.ok():
+                rclpy.shutdown()
+        except Exception as e:
+            # rclpy.shutdown() can raise if already shut down
+            self.logger.debug(f"rclpy shutdown raised: {e}")

@@ -1,0 +1,599 @@
+# autoware_carla_interface_v2
+
+## ROS 2 / Autoware bridge for CARLA 1.0
+
+This package connects Autoware to the [CARLA 1.0](https://github.com/carla-simulator/carla/releases/tag/1.0)
+simulator (Unreal Engine 5.8). It is a port of
+[`autoware_carla_interface`](https://github.com/autowarefoundation/autoware_universe/tree/main/simulator/autoware_carla_interface)
+from Autoware Universe, which targets CARLA 0.9.15 / 0.10, to CARLA 1.0.
+
+The simulator is reached through [typesafe_carla](https://github.com/hakuturu583/typesafe_carla)
+([PyPI](https://pypi.org/project/typesafe-carla/)) instead of the official `carla` Python package.
+typesafe_carla is a statically typed client that calls LibCarla through a C ABI; its wheel ships
+LibCarla built from CARLA's `1.0` tag, and the bridge uses it from CPython through
+`typesafe_carla.carla`, which keeps the CARLA Python API's names.
+
+Thanks to <https://github.com/gezp> for ROS 2 Humble support for CARLA Communication, which the
+original package started from.
+
+## Supported Environment
+
+| ubuntu | ros   | carla | CARLA client           | autoware |
+| :----: | :---: | :---: | :--------------------: | :------: |
+| 24.04  | jazzy | 1.0   | typesafe-carla 0.8.x   |  2.0.0   |
+
+## Differences from `autoware_carla_interface`
+
+- **CARLA 1.0 only.** The client loads LibCarla 1.0 (`TYPESAFE_CARLA_CARLA_REF=1.0`, set by
+  `modules/carla_client.py` unless the environment already chose a ref). The bridge logs the
+  server version at start-up, warns when it is not 1.0, and stops right away when no server answers.
+- **No `carla` Python package.** Every module imports `carla` from
+  `autoware_carla_interface_v2.modules.carla_client`. That module also holds the adaptations
+  typesafe_carla needs, which are the API differences to know when changing the code:
+  - Actors are returned as plain `carla.Actor`s; vehicle, sensor and traffic-light methods are
+    reached through `as_vehicle()`, `as_sensor()` and `as_traffic_light()`.
+  - A sensor callback receives a `carla.SensorData`; `to_measurement()` converts it to
+    `Image`, `LidarMeasurement`, `GnssMeasurement` or `IMUMeasurement`.
+  - `carla.VehicleLightState` is an `IntEnum`, so combined flags are passed as an `int`.
+- **CARLA 1.0 defaults.** The default ego blueprint is `vehicle.lincoln.mkz` (the Prius is not in
+  the CARLA 1.0 catalogue) and the default level is `Town10HD_Opt`.
+- The data provider derived from the CARLA scenario runner was cut down to what the bridge uses.
+
+## Setup
+
+### Install
+
+#### Prerequisites
+
+1. **Install CARLA 1.0**: download `CARLA_1.0.tar.gz` from the
+   [CARLA 1.0 release](https://github.com/carla-simulator/carla/releases/tag/1.0) and extract it.
+   The official CARLA Python package is not needed.
+
+2. **Install typesafe_carla**: it is declared as the rosdep key `python3-typesafe-carla-pip`, which
+   rosdistro does not have yet. Either add this repository's rosdep definition once:
+
+   ```bash
+   echo "yaml https://raw.githubusercontent.com/hakuturu583/autoware_carla_interface_v2/main/rosdep/typesafe_carla.yaml" \
+     | sudo tee /etc/ros/rosdep/sources.list.d/50-typesafe-carla.list
+   rosdep update
+   ```
+
+   or install it with pip directly:
+
+   ```bash
+   pip install "typesafe-carla>=0.8.7,<0.9"   # add --break-system-packages on Ubuntu 24.04's system Python
+   ```
+
+   The wheel includes LibCarla prebuilt for CARLA 1.0, so nothing is compiled.
+
+3. **Maps**: CARLA 1.0 ships `Town10HD_Opt`; the other towns come with the
+   [additional maps package](https://github.com/carla-simulator/carla/releases/tag/1.0). Autoware
+   needs a matching Lanelet2 map and point-cloud map for the level, laid out as an Autoware map
+   directory (`lanelet2_map.osm`, `pointcloud_map.pcd`, `map_projector_info.yaml`). The level
+   name is taken from the map directory name (`map_path`) unless `carla_map` is set.
+
+### Build
+
+```bash
+rosdep install --from-paths src --ignore-src -y
+colcon build --symlink-install --packages-up-to autoware_carla_interface_v2 \
+    --cmake-args -DCMAKE_BUILD_TYPE=Release
+```
+
+### Run
+
+1. Start CARLA 1.0:
+
+   ```bash
+   cd Carla-1.0-Linux-Shipping
+   ./CarlaUnreal.sh -RenderOffScreen -nosound
+   # No GPU (LiDAR / IMU / GNSS only, see "Rendering-less CARLA servers"):
+   # ./CarlaUnreal.sh -nullrhi -nosound
+   ```
+
+2. Start the bridge:
+
+   ```bash
+   ros2 launch autoware_carla_interface_v2 autoware_carla_interface_v2.launch.xml \
+       map_path:=$HOME/autoware_data/maps/Town10HD_Opt
+   ```
+
+   and Autoware with the CARLA sensor kit (`sensor_model:=carla_sensor_kit`) and
+   `vehicle_model:=sample_vehicle`, without starting another simulator bridge.
+
+3. Set initial pose (Init by GNSS)
+4. Set goal position
+5. Wait for planning
+6. Engage
+
+### Test
+
+```bash
+colcon test --packages-select autoware_carla_interface_v2
+```
+
+`test/test_carla_server.py` checks the connection to a real CARLA 1.0 server: it compares the
+server and LibCarla versions, spawns the ego vehicle and an IMU through the bridge's own code,
+ticks the world and checks the measurements. It is skipped unless `CARLA_HOST` is set:
+
+```bash
+CARLA_HOST=localhost CARLA_PORT=2000 \
+  python3 -m pytest src/autoware_carla_interface_v2/autoware_carla_interface_v2/test/test_carla_server.py -s
+```
+
+### Viewing Multi-Camera View in RViz
+
+The `carla_sensor_kit` includes 6 cameras providing 360-degree coverage (Front, Front-Left, Front-Right, Back, Back-Left, Back-Right). A multi-camera combiner node automatically combines all camera feeds into a single 2x3 grid view.
+
+To view the combined camera feed in RViz:
+
+1. In the **Displays** panel (left side), click the **"Add"** button
+2. Select the **"By topic"** tab
+3. Navigate to `/sensing/camera/all_cameras/image_raw`
+4. Select **"Image"** display type
+5. Click **OK**
+
+![Multi-Camera View in RViz](docs/images/rviz_multi_camera_view.png)
+
+The combined view shows all 6 cameras with labels: FL (Front-Left), F (Front), FR (Front-Right), BL (Back-Left), B (Back), BR (Back-Right).
+
+**Note:** If you don't need the multi-camera combiner (to save CPU resources), you can comment out the following line in `launch/autoware_carla_interface_v2.launch.xml`:
+
+```xml
+<!-- Multi-camera combiner for RViz visualization -->
+<!-- <node pkg="autoware_carla_interface_v2" exec="multi_camera_combiner" output="screen"/> -->
+```
+
+### Following the Ego Vehicle with the CARLA Spectator Camera
+
+The `spectator_follow` script locks the CARLA spectator (free) camera to the ego vehicle, so the in-simulator view chases the car automatically instead of having to pan manually. It connects to the running CARLA server, looks up the ego actor by its `role_name`, and updates the spectator transform at a fixed rate.
+
+Run it in a separate terminal while CARLA and the Autoware bridge are running:
+
+```bash
+ros2 run autoware_carla_interface_v2 spectator_follow
+```
+
+Common options (all optional):
+
+| Flag         | Default       | Description                                                 |
+| ------------ | ------------- | ----------------------------------------------------------- |
+| `--host`     | `localhost`   | CARLA server host                                           |
+| `--port`     | `2000`        | CARLA server RPC port                                       |
+| `--role`     | `ego_vehicle` | `role_name` attribute of the ego actor to follow            |
+| `--distance` | `8.0`         | Meters behind the ego vehicle (use `0` for a top-down view) |
+| `--height`   | `4.0`         | Meters above the ego vehicle                                |
+| `--pitch`    | `-15.0`       | Camera pitch in degrees (negative looks down)               |
+| `--rate`     | `30.0`        | Update rate in Hz                                           |
+
+For a top-down view directly above the ego vehicle:
+
+```bash
+ros2 run autoware_carla_interface_v2 spectator_follow --distance 0 --height 30 --pitch -90
+```
+
+Press `Ctrl+C` to stop the script. It will keep retrying if the ego actor is not yet spawned, and re-acquire it if it is removed and respawned.
+
+## Inner-workings / Algorithms
+
+The `InitializeInterface` class is key to setting up both the CARLA world and the ego vehicle. It fetches configuration parameters through the `autoware_carla_interface_v2.launch.xml`.
+
+The main simulation loop runs within the `carla_ros2_interface` class. This loop ticks simulation time inside the CARLA simulator at `fixed_delta_seconds` time, where data is received and published as ROS 2 messages at frequencies defined in `self.sensor_frequencies`.
+
+Ego vehicle commands from Autoware are processed through the `autoware_raw_vehicle_cmd_converter`, which calibrates these commands for CARLA. The calibrated commands are then fed directly into CARLA control via `CarlaDataProvider`.
+
+### Configurable Parameters for World Loading
+
+All the key parameters can be configured in `autoware_carla_interface_v2.launch.xml`.
+
+| Name                              | Type   | Default Value                                                                     | Description                                                                                                                                                                                                                                                                                                                                                                         |
+| --------------------------------- | ------ | --------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `host`                            | string | "localhost"                                                                       | Hostname for the CARLA server                                                                                                                                                                                                                                                                                                                                                       |
+| `port`                            | int    | "2000"                                                                            | Port number for the CARLA server                                                                                                                                                                                                                                                                                                                                                    |
+| `timeout`                         | int    | 20                                                                                | Timeout for the CARLA client                                                                                                                                                                                                                                                                                                                                                        |
+| `ego_vehicle_role_name`           | string | "ego_vehicle"                                                                     | Role name for the ego vehicle                                                                                                                                                                                                                                                                                                                                                       |
+| `vehicle_type`                    | string | "vehicle.toyota.prius"                                                            | Blueprint ID of the vehicle to spawn. The Blueprint ID of vehicles can be found in [CARLA Blueprint ID](https://carla.readthedocs.io/en/latest/catalogue_vehicles/)                                                                                                                                                                                                                 |
+| `spawn_point`                     | string | None                                                                              | Coordinates for spawning the ego vehicle (None is random). Format = [x, y, z, roll, pitch, yaw]                                                                                                                                                                                                                                                                                     |
+| `sync_mode`                       | bool   | True                                                                              | Boolean flag to set synchronous mode in CARLA                                                                                                                                                                                                                                                                                                                                       |
+| `fixed_delta_seconds`             | double | 0.05                                                                              | Time step for the simulation (related to client FPS)                                                                                                                                                                                                                                                                                                                                |
+| `use_traffic_manager`             | bool   | False                                                                             | Boolean flag to set traffic manager in CARLA                                                                                                                                                                                                                                                                                                                                        |
+| `max_real_delta_seconds`          | double | 0.05                                                                              | Parameter to limit the simulation speed below `fixed_delta_seconds`                                                                                                                                                                                                                                                                                                                 |
+| `tick_follower`                   | bool   | False                                                                             | If True, the bridge does not tick the CARLA world and instead follows the frames ticked by another client. See [Multi-client co-simulation](#multi-client-co-simulation).                                                                                                                                                                                                           |
+| `carla_map`                       | string | ""                                                                                | Explicit CARLA level name. When non-empty it overrides the name derived from `map_path`; useful for CARLA levels whose name differs from the Autoware map directory. Empty reproduces the current behavior.                                                                                                                                                                    |
+| `no_rendering_mode`               | bool   | False                                                                             | Disable CARLA scene rendering via world settings for headless/faster simulation. Applied unconditionally on world load, so the default `False` (re-)enables rendering even if the server was started headless; set `True` to keep rendering off.                                                                                                                                    |
+| `max_substep_delta_time`          | double | 0.0                                                                               | Longest physics substep [s] CARLA may take inside one simulation step. See [Physics substepping](#physics-substepping). 0 or negative (the default, suited to CARLA 1.0's Chaos physics) leaves CARLA's own substepping settings untouched.                                                                                                                                          |
+| `no_rendering_mode`               | bool   | False                                                                             | Disable CARLA scene rendering via world settings for headless/faster simulation. Applied unconditionally on world load, so the default `False` (re-)enables rendering even if the server was started headless; set `True` to keep rendering off. Camera sensors are not spawned while this is set, see [Rendering-less CARLA servers](#rendering-less-carla-servers).               |
+| `force_load_world`                | bool   | False                                                                             | Always reload the world with `client.load_world()` instead of `load_world_if_different()`. Default False reproduces the current call (with a version-tolerant fallback).                                                                                                                                                                                                            |
+| `map_origin_x`                    | double | 0.0                                                                               | X offset from the CARLA world origin to the Autoware map frame origin, for levels authored with their own local origin. Default 0.0 is the identity (no change).                                                                                                                                                                                                                    |
+| `map_origin_y`                    | double | 0.0                                                                               | Y offset from the CARLA world origin to the Autoware map frame origin. Default 0.0 is the identity (no change).                                                                                                                                                                                                                                                                     |
+| `spawn_point_ground_snap`         | bool   | False                                                                             | Snap the ego spawn point and the RViz initial pose onto CARLA map geometry via `ground_projection` (see [Ground snapping](#ground-snapping)). Default False leaves the spawn point and the fixed z-offset unchanged.                                                                                                                                                                |
+| `spawn_point_ground_offset_z`     | double | 0.5                                                                               | Z offset added above the projected ground when ground-snapping the spawn point (only used when `spawn_point_ground_snap` is True).                                                                                                                                                                                                                                                  |
+| `initial_pose_ground_offset_z`    | double | 1.0                                                                               | Z offset added above the projected ground when ground-snapping the RViz initial pose (only used when `spawn_point_ground_snap` is True).                                                                                                                                                                                                                                            |
+| `sensor_kit_name`                 | string | "carla_sensor_kit_description"                                                    | Name of the sensor kit package to use for sensor configuration. Should be the \*\_description package containing config/sensor_kit_calibration.yaml                                                                                                                                                                                                                                 |
+| `use_light_weight_sensor_mapping` | bool   | False                                                                             | If True, uses `sensor_mapping_light_weight.yaml` instead of the default `sensor_mapping.yaml` to reduce simulator load. See [Sensor Mapping (CARLA-specific)](#2-sensor-mapping-carla-specific) for details.                                                                                                                                                                        |
+| `sensor_mapping_file`             | string | "$(find-pkg-share autoware_carla_interface_v2)/config/sensor_mapping.yaml"           | Path to sensor mapping YAML configuration file. When `use_light_weight_sensor_mapping` is True, this defaults to `config/sensor_mapping_light_weight.yaml`.                                                                                                                                                                                                                         |
+| `publish_ground_truth_objects`    | bool   | False                                                                             | If True, publishes every CARLA vehicle except the ego to `/perception/object_recognition/detection/objects` as ground truth detections, so tracking and prediction run on simulator truth instead of sensor based detection. Pedestrians are not covered.                                                                                                                           |
+| `config_file`                     | string | "$(find-pkg-share autoware_carla_interface_v2)/raw_vehicle_cmd_converter.param.yaml" | Control mapping file to be used in `autoware_raw_vehicle_cmd_converter`. Current control are calibrated based on `vehicle.toyota.prius` Blueprints ID in CARLA. Changing the vehicle type may need a recalibration.                                                                                                                                                                 |
+| `traffic_light.publish`           | bool   | False                                                                             | Publish CARLA traffic-light states on `/perception/traffic_light_recognition/traffic_signals` as an `autoware_perception_msgs/TrafficLightGroupArray`. See [Publishing CARLA Traffic-Light States](#publishing-carla-traffic-light-states).                                                                                                                                         |
+| `traffic_light.force_green`       | bool   | False                                                                             | Set every CARLA traffic light to green and freeze it there at startup. Useful for camera-less closed-loop runs that have no traffic-light recognition and would otherwise hold at every signalized stop line.                                                                                                                                                                       |
+| `traffic_light.map_path`          | string | ""                                                                                | Path to the lanelet2 map (`.osm`). When set, CARLA traffic lights are matched to the map's traffic-light heads **by position** and published under the matched regulatory-element ids. Empty falls back to using the CARLA OpenDRIVE signal id directly as the group id.                                                                                                            |
+| `traffic_light.match_distance`    | double | 5.0                                                                               | Maximum head-to-head distance (m) accepted when matching a CARLA traffic light to a lanelet2 head.                                                                                                                                                                                                                                                                                  |
+| `traffic_light.match_ratio`       | double | 0.6                                                                               | Ambiguity threshold: a match is rejected when the nearest head that resolves to a _different_ signal is nearly as close as the winner (`nearest > ratio * second`). Lower is stricter.                                                                                                                                                                                              |
+| `traffic_light.id_map`            | string | ""                                                                                | Optional override, formatted `opendrive_id:group_id,...`, that pins a CARLA signal id to one or more Autoware group ids and takes precedence over position matching. A single entry can list several group ids (separated with a vertical bar) to map a shared head to all its regulatory elements; use it to recover the few lights the matcher reports as ambiguous or unmatched. |
+| `wake_sleeping_physics`           | bool   | False                                                                             | Nudge the ego physics body awake with a small `set_target_velocity` when launching from standstill. Observed on CARLA 0.10 (UE5/Chaos), where a stationary body is put to sleep and `VehicleControl` throttle does not wake it; enable it if the ego never pulls away on CARLA 1.0.                                 |
+
+> These `traffic_light.*` launch arguments are the node parameters of the same name, kept grouped together under the `traffic_light.` namespace in `ros2 param list`.
+
+#### Ground snapping
+
+When `spawn_point_ground_snap` is enabled, the ego spawn point and the RViz "2D
+Pose Estimate" initial pose are snapped onto the CARLA map geometry instead of
+using a fixed z-offset. This helps on levels (e.g. some CARLA 0.10 maps) where
+the map-frame z does not match the terrain, where a fixed offset can drop the
+vehicle far above or below the road.
+
+The ground height is obtained with `world.ground_projection`, casting a ray down
+from `z = 1000 m`. Rather than probing only the target `(x, y)`, a small
+cross-shaped neighborhood is sampled and the **highest** ground hit is used:
+
+```text
+sample offsets (dx, dy in meters)
+              (0, +1.5)
+              (0, +0.75)
+  (-1.5, 0) (-0.75, 0) (0, 0) (+0.75, 0) (+1.5, 0)
+              (0, -0.75)
+              (0, -1.5)
+```
+
+- Sampling a neighborhood (9 points) makes the result robust: a single ray can
+  miss through a mesh gap or land in a gutter/curb seam and return a height
+  below the road.
+- Taking the maximum selects the road surface rather than a lower seam or gap,
+  so the vehicle sits on top of the road instead of sinking into it.
+
+On a CARLA API without `ground_projection`, snapping is skipped and the previous
+fixed z-offset is used, so enabling the flag never raises. The spawn-point path
+logs a warning when it falls back; the RViz initial-pose fallback is silent (and
+with the default random spawn the spawn-point path is not exercised at all).
+
+### Physics substepping
+
+CARLA integrates the vehicle physics in substeps of at most
+`max_substep_delta_time`, which CARLA itself defaults to 0.01 s. At that
+resolution the angular velocity a vehicle reports stops integrating to the
+rotation its own transform performs: driving straight for 27.8 s at a 1/60 s
+step, the reported yaw rate integrated to 9.41 deg against the 0.03 deg the
+vehicle actually turned. The IMU is faithful to the body -- its gyroscope
+matches `get_angular_velocity()` to seven significant figures -- so the error
+is in the rigid body's own state, and both the IMU and the velocity report
+carry a phantom yaw rate of up to 0.9 deg/s. It is deterministic and depends on
+where the vehicle is, which is why some runs carry it and others do not.
+
+At a 2 ms substep the same drive mismatches by 0.005 deg, and across an
+eleven-drive bench set the worst phantom rate went from 0.90212 to
+0.00348 deg/s. Only the substep changes; `fixed_delta_seconds` is untouched, so
+the pacing of a run stays as it was, at the cost of more physics iterations
+inside each step -- measured at 1.3-1.8x the server's physics time per tick.
+
+All of the above is CARLA 0.9.x (PhysX). Review measurements on 0.10 (Chaos)
+found the mismatch staying within 0.03 deg at any substep, so the setting buys
+nothing measurable there while still costing 1.3-1.8x the server's physics time
+per tick. CARLA 1.0 uses Chaos as well, so this package defaults
+`max_substep_delta_time` to 0 (CARLA's own substepping); set it to e.g. 0.002
+to bring the bounded substep back.
+
+libcarla warns unless two constraints both hold:
+`fixed_delta_seconds <= max_substep_delta_time * max_substeps`, and
+`max_substeps` in the range `[1-16]`. The substep count is derived from the step
+length rather than configured separately, and a substep that would need more
+than 16 of them to fill a step is lengthened to fill it with exactly 16 -- at
+the package's default 0.05 s step, a requested 2 ms becomes 3.125 ms. Capping
+the count instead would satisfy the range and break the inequality.
+
+### Multi-client co-simulation
+
+By default this bridge owns the CARLA simulation clock: its main loop calls `world.tick()` on every
+cycle. A server in synchronous mode advances one frame per `tick()` call, so a second client that
+also ticks, for example an external traffic simulator feeding background vehicles into the same
+server, makes the simulation advance more than once per intended step.
+
+Setting `tick_follower` to `True` puts the bridge in a passive mode. It no longer ticks the world in
+its main loop, and instead publishes sensor data, the clock and the ego control for the frames that
+the external client ticks. Exactly one client in the whole setup may own the clock.
+
+Two things to keep in mind when using this mode:
+
+- **Start the bridge before the tick owner.** Loading the world still ticks it a few times to bring
+  up the ego vehicle and its sensors, and those ticks must not race the external owner.
+- **The cadence belongs to the tick owner**, so `max_real_delta_seconds` no longer paces the loop.
+  Set `fixed_delta_seconds` to the step length that the owner uses.
+- **`/clock` starts at zero on the first frame that the bridge processes.** In this mode it stays a
+  constant offset behind the CARLA elapsed time: the idle time before the owner started.
+
+If the bridge cannot keep up with the incoming cadence it drops the frames it has fallen behind on
+and reports how many it skipped through a throttled warning.
+
+### Sensor Configuration
+
+The interface uses the **`carla_sensor_kit`** which provides 6 cameras for 360-degree coverage, LiDAR, IMU, and GNSS sensors. Sensor configurations are dynamically loaded from Autoware sensor kit calibration files through two configuration files:
+
+#### 1. Sensor Kit Calibration (from Autoware sensor kit)
+
+Located in `<sensor_kit_name>_description/config/sensor_kit_calibration.yaml`
+
+Defines sensor positions and orientations relative to `base_link` (rear axle center). Example:
+
+```yaml
+sensor_kit_base_link:
+  CAM_FRONT/camera_link:
+    x: 2.225
+    y: 0.000
+    z: 1.600
+    roll: 0.000
+    pitch: 0.000
+    yaw: 0.000 # Angles in radians
+```
+
+#### 2. Sensor Mapping (CARLA-specific)
+
+Located in `config/sensor_mapping.yaml`
+
+Maps Autoware sensors to CARLA sensor types and parameters. Key sections:
+
+- `default_sensor_kit_name`: Default sensor kit to use (e.g., `carla_sensor_kit_description`)
+- `sensor_mappings`: Maps each sensor to CARLA type and ROS topics
+- `enabled_sensors`: List of sensors to spawn in CARLA
+- `vehicle_config` (optional): Vehicle parameters like wheelbase. `wheelbase` (default 2.85 m) also sets where the bridge puts `base_link`: `wheelbase / 2` behind the CARLA actor origin (vehicle center), for the sensors as well as for the GNSS pose, the ground truth localization and the RViz initial pose. `spawn_point` places the actor origin.
+
+Example sensor mapping:
+
+```yaml
+sensor_mappings:
+  CAM_FRONT/camera_link:
+    carla_type: sensor.camera.rgb
+    id: CAM_FRONT
+    ros_config:
+      frame_id: CAM_FRONT/camera_optical_link
+      topic_image: /sensing/camera/CAM_FRONT/image_raw
+      topic_info: /sensing/camera/CAM_FRONT/camera_info
+      frequency_hz: 11
+      qos_profile: reliable
+      image_encoding: bgra8
+    parameters:
+      image_size_x: 1600
+      image_size_y: 900
+      fov: 70.0
+```
+
+`image_encoding` applies to cameras and accepts `bgra8` (default, what CARLA
+renders), `bgr8` or `mono8`. Publishing `mono8` converts once in the bridge and
+sends a quarter of the bytes, which is worth it when every consumer of that
+camera works on luminance alone, such as feature tracking or visual odometry.
+`bgr8` drops only the alpha channel, which CARLA fills with 255 and no consumer
+reads, so it costs no information at all. A 1600x900 frame is 5,760,000 bytes as
+`bgra8`, 4,320,000 bytes as `bgr8` and 1,440,000 bytes as `mono8`.
+
+For CARLA sensor parameters, see [CARLA Sensor Reference](https://carla.readthedocs.io/en/latest/ref_sensors/).
+
+A `carla_type` of any `sensor.camera.*` is published as a camera: CARLA's depth
+and semantic segmentation cameras deliver the same BGRA frame through the same
+callback as the RGB one, and are published on the mapping's `topic_image` and
+`topic_info` with the encoded values untouched.
+
+##### Capture Rate
+
+`frequency_hz` throttles what the bridge publishes; it does not change how often
+CARLA captures. A sensor left at CARLA's default captures on every simulation
+step, so at a 1/600 s step a camera renders 600 frames a second and the bridge
+discards all but a few. The throttle can also only drop whole frames, so a
+mapping asking for 60 Hz at that step publishes at 85.7 Hz and a 200 Hz IMU at
+300 Hz.
+
+Set `sensor_tick` (seconds between captures) under the sensor's `parameters` to
+have CARLA generate at the rate the mapping wants:
+
+```yaml
+parameters:
+  image_size_x: 1600
+  image_size_y: 900
+  fov: 70.0
+  sensor_tick: 0.0166667
+```
+
+Sensors without a `sensor_tick` keep capturing every step, as before. Avoid a
+`sensor_tick` exactly equal to `fixed_delta_seconds`: CARLA compares the tick
+interval against the elapsed time with a float, and a sensor whose tick equals
+the step can miss frames
+([carla#3653](https://github.com/carla-simulator/carla/issues/3653)).
+
+CARLA cannot capture between steps, so it holds the requested average by
+alternating shorter and longer gaps -- a 0.04 s tick at a 1/60 s step arrives
+after two steps and then three. The publish throttle allows a frame of such a
+sensor to be up to half its own tick early, so those arrivals are published
+instead of dropped.
+
+##### Sensor Noise
+
+The IMU and GNSS are spawned noise-free unless the mapping says otherwise, which
+is what reproducing a run wants. It also means anything consuming those sensors
+sees a measurement no hardware produces: a localization or odometry stack scored
+against a perfect gyro reports an accuracy it will not reach on a vehicle.
+
+Set any of the CARLA noise attributes under the sensor's `parameters` to get a
+sensor that behaves like hardware:
+
+```yaml
+sensor_mappings:
+  imu_link:
+    carla_type: sensor.other.imu
+    id: imu
+    ros_config:
+      frame_id: tamagawa/imu_link
+      topic: /sensing/imu/imu_data
+      frequency_hz: 50
+    parameters:
+      noise_gyro_stddev_x: 0.001
+      noise_gyro_stddev_y: 0.001
+      noise_gyro_stddev_z: 0.001
+      noise_gyro_bias_x: 0.0005
+      noise_accel_stddev_x: 0.01
+```
+
+Recognized names are `noise_accel_stddev_{x,y,z}`, `noise_gyro_stddev_{x,y,z}`
+and `noise_gyro_bias_{x,y,z}` for the IMU, and `noise_{alt,lat,lon}_stddev` and
+`noise_{alt,lat,lon}_bias` for the GNSS. Anything left out stays at zero.
+
+##### Light-Weight Sensor Mapping
+
+For machines with limited GPU/CPU resources, an alternative `config/sensor_mapping_light_weight.yaml` is provided to reduce simulator load. Compared to the default mapping, it:
+
+- Uses a **single front camera** (`CAM_FRONT`) instead of the 6-camera 360-degree setup, with a wider FOV (120°) and lower resolution (1080x720) to roughly cover the area in front of the vehicle.
+- Lowers sensor frequencies (e.g., LiDAR/camera at 10 Hz instead of 11 Hz).
+- Keeps the same LiDAR, IMU, and GNSS configuration as the default mapping.
+
+When enabled via `use_light_weight_sensor_mapping:=True`, the launch file also skips the `image_transport` republish nodes for the disabled cameras and the `multi_camera_combiner` node automatically.
+
+Example usage:
+
+```bash
+ros2 launch autoware_carla_interface_v2 autoware_carla_interface_v2.launch.xml \
+    map_path:=$HOME/autoware_data/maps/Town10HD_Opt \
+    use_light_weight_sensor_mapping:=True
+```
+
+Note that with this configuration, features that depend on the surround cameras (such as the multi-camera RViz view) are unavailable.
+
+##### Rendering-less CARLA servers
+
+A CARLA server started without a renderer (`CarlaUnreal.sh -nullrhi`, the way CARLA 1.0 runs without a GPU) **crashes as soon as a camera sensor is spawned on it**. Everything the bridge asks of CARLA afterwards fails with an opaque `RuntimeError: std::exception`, which makes the original cause hard to recognise in the logs. The ray-cast LiDAR, by contrast, needs no renderer and keeps producing points, so such a server is a practical way to run LiDAR-only closed-loop tests without a display.
+
+A client cannot detect a renderer-less server: its world settings, blueprint library and sensor attributes are identical to a rendering one. Say so with `no_rendering_mode`, which already means "this run does not render":
+
+```bash
+ros2 launch autoware_carla_interface_v2 autoware_carla_interface_v2.launch.xml \
+    map_path:=$HOME/autoware_data/maps/Town10HD_Opt \
+    no_rendering_mode:=True
+```
+
+With `no_rendering_mode:=True` the cameras in the sensor mapping are **not spawned in CARLA**, and the sensors that work without rendering (LiDAR, IMU, GNSS) are spawned as usual. The skipped cameras are named in a warning, and their topics stay advertised but silent. No separate camera-free sensor mapping is needed: the same mapping works with and without rendering.
+
+This also fixes the plain `no_rendering_mode:=True` case on a rendering server, where cameras used to be spawned only to return empty images.
+
+### World Loading
+
+The `carla_ros.py` sets up the CARLA world:
+
+1. **Client Connection**:
+
+   ```python
+   client = carla.Client(self.local_host, self.port)
+   client.set_timeout(self.timeout)
+   ```
+
+2. **Load the Map**:
+
+   Map loaded in CARLA world with map according to `carla_map` parameter.
+
+   ```python
+   client.load_world(self.map_name)
+   self.world = client.get_world()
+   ```
+
+   After loading, the interface checks that the map CARLA is actually running is
+   the one that was requested. If it is not - the level does not exist, the
+   server failed to switch, or the connection dropped - the mismatch is logged to
+   `rosout` and the node aborts with `CarlaWorldLoadError`. Running Autoware
+   against a map the simulator is not simulating would silently invalidate the
+   whole run, so it is treated as fatal rather than tolerated.
+
+3. **Spawn Ego Vehicle**:
+
+   Vehicle are spawn according to `vehicle_type`, `spawn_point`, and `agent_role_name` parameter.
+
+   ```python
+   spawn_point = carla.Transform()
+   point_items = self.spawn_point.split(",")
+   if len(point_items) == 6:
+      spawn_point.location.x = float(point_items[0])
+      spawn_point.location.y = float(point_items[1])
+      spawn_point.location.z = float(point_items[2]) + 2
+      spawn_point.rotation.roll = float(point_items[3])
+      spawn_point.rotation.pitch = float(point_items[4])
+      spawn_point.rotation.yaw = float(point_items[5])
+   CarlaDataProvider.request_new_actor(self.vehicle_type, spawn_point, self.agent_role_name)
+   ```
+
+## Traffic Light Recognition
+
+The maps provided by the Carla Simulator ([Carla Lanelet2 Maps](https://bitbucket.org/carla-simulator/autoware-contents/src/master/maps/)) currently lack proper traffic light components for Autoware and have different latitude and longitude coordinates compared to the pointcloud map. To enable traffic light recognition, follow the steps below to modify the maps.
+
+- Options to Modify the Map
+
+  - A. Create a New Map from Scratch
+  - Use the [TIER IV Vector Map Builder](https://tools.tier4.jp/feature/vector_map_builder_ll2/) to create a new map.
+
+  - B. Modify the Existing Carla Lanelet2 Maps
+  - Adjust the longitude and latitude of the [Carla Lanelet2 Maps](https://bitbucket.org/carla-simulator/autoware-contents/src/master/maps/) to align with the PCD (origin).
+    - Use this [tool](https://github.com/mraditya01/offset_lanelet2/tree/main) to modify the coordinates.
+    - Snap Lanelet with PCD and add the traffic lights using the [TIER IV Vector Map Builder](https://tools.tier4.jp/feature/vector_map_builder_ll2/).
+
+- When using the TIER IV Vector Map Builder, you must convert the PCD format from `binary_compressed` to `ascii`. You can use `pcl_tools` for this conversion.
+- For reference, an example of Town01 with added traffic lights at one intersection can be downloaded [here](https://drive.google.com/drive/folders/1QFU0p3C8NW71sT5wwdnCKXoZFQJzXfTG?usp=sharing).
+
+### Publishing CARLA Traffic-Light States
+
+Instead of running camera-based recognition, the bridge can publish the CARLA server's
+traffic-light states directly. Setting `traffic_light.publish:=true` publishes an
+`autoware_perception_msgs/TrafficLightGroupArray` on
+`/perception/traffic_light_recognition/traffic_signals` every tick. Each CARLA light is
+reported as a circular signal whose color and status follow the CARLA state: `Red`/`Yellow`/`Green`
+map to `RED`/`AMBER`/`GREEN` with status `SOLID_ON`, the known-dark `Off` state maps to status
+`SOLID_OFF`, and only a state the bridge cannot interpret is published as `UNKNOWN`/`UNKNOWN`.
+
+Autoware keys traffic signals by `traffic_light_group_id`, the id of a `traffic_light`
+regulatory element in the lanelet2 map. The bridge resolves which group(s) each CARLA light
+belongs to as follows, in order of precedence:
+
+1. **`traffic_light.id_map` override.** If the light's OpenDRIVE signal id appears in the
+   `opendrive_id:group_id[|group_id...],...` map, those group ids are used directly. One entry
+   may pin several group ids (`|`-separated), so a shared physical head can be mapped to every
+   regulatory element that governs it. A malformed entry (no `:`, a non-integer id, or no group
+   id after the `:`) is skipped with a warning naming the offending entry, so a typo neither
+   stops the bridge nor silently overrides a light with an empty group list; the remaining
+   entries still apply.
+2. **Position matching (`traffic_light.map_path`).** When a lanelet2 map is given, each CARLA
+   light head is matched to the nearest map traffic-light head, and its state is published under
+   **every** regulatory element that references that head (one physical light is commonly shared
+   by several regulatory elements, one per approaching lane). This needs no id convention between
+   CARLA and the map — it works for hand-authored / Vector Map Builder maps whose regulatory-element
+   ids do not correspond to the OpenDRIVE signal ids.
+3. **OpenDRIVE-id fallback.** With no map path and no override, the OpenDRIVE signal id is used
+   directly as the group id (correct only for maps generated so regulatory-element ids preserve
+   the OpenDRIVE signal ids).
+
+Position matching is deliberately conservative: it binds a CARLA light only when a single map head
+is clearly closest. If a head belonging to a _different_ signal is nearly as close (the classic
+"light across the intersection" case, controlled by `traffic_light.match_ratio`), is exactly as
+close (a tie has no winner, so the .osm order must not decide it), or nothing is within
+`traffic_light.match_distance`, the light is left unpublished and logged as ambiguous / unmatched
+rather than guessed. Watch the node's startup log for the match report (`N matched, M ambiguous,
+K too far`) and pin any reported light through `traffic_light.id_map` if you need it.
+
+> Position matching reads the lanelet2 node `local_x`/`local_y` tags, i.e. the Autoware map frame,
+> and expresses each CARLA head in that frame via `map_origin_x`/`map_origin_y` (the same offsets
+> used for localization). If localization is aligned, matching is too.
+
+To let the ego proceed through all intersections without any recognition setup — for example in
+camera-less closed-loop runs — set `traffic_light.force_green:=true`. At startup this sets every
+CARLA traffic light to green and freezes it; combined with `traffic_light.publish:=true` the
+frozen green states are also published on the topic above.
+
+## Tips
+
+- Misalignment might occurs during initialization, pressing `init by gnss` button should fix it.
+- Changing the `fixed_delta_seconds` can increase the simulation tick (default 0.05 s), some sensor params in `sensor_mapping.yaml` need to be adjusted when it is changed (example: LIDAR rotation frequency should match the FPS).
+
+## Known Issues and Future Works
+
+- **Testing on procedural maps (Adv Digital Twin)**: Currently unable to test due to failures in creating the Adv Digital Twin map.
+- **Traffic light recognition**: The default CARLA Lanelet2 maps lack proper traffic light regulatory elements. See the "Traffic Light Recognition" section above for workarounds, or bypass camera recognition entirely with `traffic_light.publish` (see "Publishing CARLA Traffic-Light States").
