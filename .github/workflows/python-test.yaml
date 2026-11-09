@@ -1,6 +1,6 @@
 name: python-test
 
-# The Python bridge against the real typesafe_carla client (LibCarla 1.0),
+# The node's tests against the real typesafe_carla client (LibCarla 1.0),
 # without a CARLA server: the server test is skipped unless CARLA_HOST is set.
 on:
   push:
@@ -21,12 +21,11 @@ jobs:
         run: |
           apt-get update -qq
           DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3-pip python3-pytest \
-            python3-opencv ros-jazzy-cv-bridge ros-jazzy-sensor-msgs-py \
-            ros-jazzy-autoware-perception-msgs ros-jazzy-autoware-vehicle-msgs
-          pip install --break-system-packages "typesafe-carla>=0.8.7,<0.9" transforms3d
+            python3-yaml ros-jazzy-autoware-perception-msgs ros-jazzy-autoware-vehicle-msgs
+          pip install --break-system-packages "typesafe-carla>=0.8.7,<0.9"
       - name: Unit tests
         shell: bash
         run: |
           source /opt/ros/jazzy/setup.bash
           cd src/autoware_carla_interface_v2/autoware_carla_interface_v2
-          PYTHONPATH=$PWD/src:$PYTHONPATH python3 -m pytest test -v
+          PYTHONPATH=$PWD:$PYTHONPATH python3 -m pytest test -v

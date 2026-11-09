@@ -1,11 +1,25 @@
-#!/usr/bin/env python3
+# Copyright 2026 Tier IV, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Keep the CARLA spectator camera behind the ego vehicle."""
 import argparse
 import math
 import sys
 import time
 
-from autoware_carla_interface_v2.modules.carla_client import as_vehicle
-from autoware_carla_interface_v2.modules.carla_client import carla
+from .carla_client import as_vehicle
+from .carla_client import carla
 
 
 def find_ego(world, role_name):
@@ -37,9 +51,7 @@ def main():
     parser.add_argument("--host", default="localhost", help="CARLA server host")
     parser.add_argument("--port", type=int, default=2000, help="CARLA server RPC port")
     parser.add_argument("--timeout", type=float, default=10.0, help="Client timeout (s)")
-    parser.add_argument(
-        "--role", default="ego_vehicle", help="role_name attribute of the ego actor"
-    )
+    parser.add_argument("--role", default="ego", help="role_name attribute of the ego actor")
     parser.add_argument(
         "--distance", type=float, default=8.0, help="Meters behind the ego (use 0 for top-down)"
     )

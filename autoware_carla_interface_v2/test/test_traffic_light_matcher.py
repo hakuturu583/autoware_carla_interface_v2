@@ -16,11 +16,11 @@
 
 import textwrap
 
-from autoware_carla_interface_v2.modules.traffic_light_matcher import MapTrafficLights
-from autoware_carla_interface_v2.modules.traffic_light_matcher import MatchResult
-from autoware_carla_interface_v2.modules.traffic_light_matcher import load_map_traffic_lights
-from autoware_carla_interface_v2.modules.traffic_light_matcher import match_traffic_lights
-from autoware_carla_interface_v2.modules.traffic_light_matcher import parse_id_map_override
+from autoware_carla_interface_v2.traffic_light_matcher import MapTrafficLights
+from autoware_carla_interface_v2.traffic_light_matcher import MatchResult
+from autoware_carla_interface_v2.traffic_light_matcher import load_map_traffic_lights
+from autoware_carla_interface_v2.traffic_light_matcher import match_traffic_lights
+from autoware_carla_interface_v2.traffic_light_matcher import parse_id_map_override
 
 
 def _map(heads):

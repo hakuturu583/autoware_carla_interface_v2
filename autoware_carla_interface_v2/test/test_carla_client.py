@@ -18,12 +18,12 @@ import os
 
 import pytest
 
-from autoware_carla_interface_v2.modules import carla_client
-from autoware_carla_interface_v2.modules.carla_client import as_sensor
-from autoware_carla_interface_v2.modules.carla_client import as_traffic_light
-from autoware_carla_interface_v2.modules.carla_client import as_vehicle
-from autoware_carla_interface_v2.modules.carla_client import carla
-from autoware_carla_interface_v2.modules.carla_client import to_measurement
+from autoware_carla_interface_v2 import carla_client
+from autoware_carla_interface_v2.carla_client import as_sensor
+from autoware_carla_interface_v2.carla_client import as_traffic_light
+from autoware_carla_interface_v2.carla_client import as_vehicle
+from autoware_carla_interface_v2.carla_client import carla
+from autoware_carla_interface_v2.carla_client import to_measurement
 
 
 class _FakeActor:

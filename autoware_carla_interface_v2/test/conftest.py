@@ -14,10 +14,10 @@
 
 """Leave out the test files whose runtime dependencies are not installed.
 
-The bridge's runtime dependencies (the typesafe_carla client, the message
-packages the Python node imports) are exec_depends, so a build-only
-environment such as the Autoware Index CI does not install them. The files
-that import them are not collected there instead of failing.
+The node's runtime dependencies (the typesafe_carla client, the message
+packages it imports) are exec_depends, which a build-only environment such
+as the Autoware Index CI does not install. The files that import them are
+not collected there instead of failing.
 """
 
 import importlib.util
@@ -30,21 +30,24 @@ def _missing(*modules):
     return any(importlib.util.find_spec(module) is None for module in modules)
 
 
+_PURE = ("yaml",)
 _CLIENT = ("typesafe_carla",)
 _NODE = _CLIENT + (
+    "rclpy",
+    "ament_index_python",
     "autoware_perception_msgs",
     "autoware_vehicle_msgs",
-    "cv2",
-    "cv_bridge",
-    "tier4_vehicle_msgs",
-    "transforms3d",
+    "geometry_msgs",
+    "yaml",
 )
 
 _IGNORED = set()
+if _missing(*_PURE):
+    _IGNORED |= {"test_sensor_kit.py"}
+if _missing(*_CLIENT):
+    _IGNORED |= {"test_carla_client.py"}
 if _missing(*_NODE):
-    _IGNORED |= {"test_light_state.py", "test_no_rendering_mode.py"}
-if _missing(*_CLIENT, "rclpy"):
-    _IGNORED |= {"test_carla_client.py", "test_carla_server.py", "test_sensor_interface.py"}
+    _IGNORED |= {"test_node_helpers.py", "test_carla_server.py"}
 
 
 @pytest.hookimpl(tryfirst=True)
