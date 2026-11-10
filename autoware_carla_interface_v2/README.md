@@ -41,7 +41,8 @@ None of that conversion is needed with CARLA 1.0.
    `rosdep install` below installs it with pip. On Ubuntu 24.04 (PEP 668) run rosdep from the
    workspace's Python venv, as Autoware sets it up
    ([`python_venv` role](https://github.com/autowarefoundation/autoware/tree/main/ansible/roles/python_venv),
-   `/opt/autoware-venv` in its Docker images), so pip installs into the venv. The wheel carries LibCarla built for CARLA 1.0,
+   `/opt/autoware-venv` in its Docker images), so pip installs into the venv; rosdep 0.27.0 or
+   later is needed for it to accept a venv in place of `PIP_BREAK_SYSTEM_PACKAGES`. The wheel carries LibCarla built for CARLA 1.0,
    so nothing is compiled. The key is not pinned: it installs the latest release, and this
    package is written against 0.8.x (0.8.7 or later). To pin it, install it yourself and skip
    the key: `pip install "typesafe-carla>=0.8.7,<0.9"` (add `--break-system-packages` for
