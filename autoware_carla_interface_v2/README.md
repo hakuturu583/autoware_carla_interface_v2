@@ -38,8 +38,10 @@ None of that conversion is needed with CARLA 1.0.
    [release](https://github.com/carla-simulator/carla/releases/tag/1.0). The official `carla`
    Python package is not needed.
 2. **typesafe_carla** is rosdistro's rosdep key `python3-typesafe-carla-pip`, so the
-   `rosdep install` below installs it with pip; on Ubuntu 24.04 rosdep only runs pip with
-   `PIP_BREAK_SYSTEM_PACKAGES=1` set (PEP 668). The wheel carries LibCarla built for CARLA 1.0,
+   `rosdep install` below installs it with pip. On Ubuntu 24.04 (PEP 668) run rosdep from the
+   workspace's Python venv, as Autoware sets it up
+   ([`python_venv` role](https://github.com/autowarefoundation/autoware/tree/main/ansible/roles/python_venv),
+   `/opt/autoware-venv` in its Docker images), so pip installs into the venv. The wheel carries LibCarla built for CARLA 1.0,
    so nothing is compiled. The key is not pinned: it installs the latest release, and this
    package is written against 0.8.x (0.8.7 or later). To pin it, install it yourself and skip
    the key: `pip install "typesafe-carla>=0.8.7,<0.9"` (add `--break-system-packages` for
@@ -48,7 +50,7 @@ None of that conversion is needed with CARLA 1.0.
 3. Build:
 
    ```bash
-   PIP_BREAK_SYSTEM_PACKAGES=1 rosdep install --from-paths src --ignore-src -y
+   rosdep install --from-paths src --ignore-src -y --as-root pip:false   # from the venv
    colcon build --packages-up-to autoware_carla_interface_v2
    ```
 

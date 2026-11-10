@@ -24,9 +24,10 @@ differences from the Autoware Universe package.
 mkdir -p ~/carla_ws/src && cd ~/carla_ws/src
 git clone https://github.com/hakuturu583/autoware_carla_interface_v2.git
 cd ~/carla_ws
-# typesafe_carla comes from rosdistro's python3-typesafe-carla-pip, installed with pip; Ubuntu
-# 24.04 (PEP 668) needs PIP_BREAK_SYSTEM_PACKAGES=1 for rosdep to run pip at all.
-PIP_BREAK_SYSTEM_PACKAGES=1 rosdep install --from-paths src --ignore-src -y
+# typesafe_carla comes from rosdistro's python3-typesafe-carla-pip, a pip key. Run rosdep from
+# the workspace's Python venv (Autoware's python_venv role, or /opt/autoware-venv in its images)
+# so pip installs into it; --as-root pip:false keeps rosdep from running the system pip with sudo.
+rosdep install --from-paths src --ignore-src -y --as-root pip:false
 colcon build --packages-up-to autoware_carla_interface_v2
 ```
 
