@@ -67,7 +67,12 @@ def _convert(actor, kind, predicate):
         return None
     if isinstance(actor, getattr(carla, kind)):
         return actor
-    if not getattr(actor, predicate, False):
+    # typesafe_carla's is_vehicle / is_sensor / is_traffic_light are methods;
+    # the bound method itself is always truthy.
+    flag = getattr(actor, predicate, False)
+    if callable(flag):
+        flag = flag()
+    if not flag:
         return None
     return getattr(actor, "as_" + _SNAKE[kind])()
 

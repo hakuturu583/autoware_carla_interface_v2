@@ -48,6 +48,41 @@ class _FakeActor:
         return ("traffic_light", self)
 
 
+class _FakeTypesafeActor(_FakeActor):
+    """As typesafe_carla has them: the kind predicates are methods, not attributes."""
+
+    def __init__(self, kind):
+        super().__init__(kind)
+        flags = (self.is_vehicle, self.is_sensor, self.is_traffic_light)
+        self.is_vehicle = lambda: flags[0]
+        self.is_sensor = lambda: flags[1]
+        self.is_traffic_light = lambda: flags[2]
+
+    def as_vehicle(self):
+        assert self.is_vehicle()
+        return ("vehicle", self)
+
+    def as_sensor(self):
+        assert self.is_sensor()
+        return ("sensor", self)
+
+    def as_traffic_light(self):
+        assert self.is_traffic_light()
+        return ("traffic_light", self)
+
+
+def test_actor_conversions_call_method_predicates():
+    # A bound method is always truthy: reading is_sensor without calling it took
+    # every actor for a sensor, and as_sensor() raised on the ego's util.actor.empty.
+    frame = _FakeTypesafeActor("other")
+    sensor = _FakeTypesafeActor("sensor")
+    assert as_sensor(frame) is None
+    assert as_vehicle(frame) is None
+    assert as_traffic_light(frame) is None
+    assert as_sensor(sensor) == ("sensor", sensor)
+    assert as_vehicle(sensor) is None
+
+
 def test_the_client_is_typesafe_carla():
     assert carla.__name__ == "typesafe_carla.carla"
 
