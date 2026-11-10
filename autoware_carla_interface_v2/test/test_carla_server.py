@@ -12,11 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The node against a running CARLA 1.0 server started with -ros2.
+"""The node against a running CARLA 1.0 server started with --ros2.
 
 Skipped unless CARLA_HOST is set:
 
-    ./CarlaUnreal.sh -ros2 -nullrhi -nosound     # no GPU needed
+    ./CarlaUnreal.sh --ros2 -nullrhi -nosound     # no GPU needed
     CARLA_HOST=localhost CARLA_PORT=2000 python3 -m pytest test/test_carla_server.py -s
 
 It runs the node's own start-up (version check, settings, ego with
@@ -34,6 +34,19 @@ HOST = os.environ.get("CARLA_HOST")
 PORT = int(os.environ.get("CARLA_PORT", "2000"))
 
 pytestmark = pytest.mark.skipif(not HOST, reason="CARLA_HOST is not set (no CARLA server)")
+
+
+def _alive_ids(world):
+    """Ids of the actors the world holds after the next frame.
+
+    typesafe_carla's World.get_actor(id) and get_actors(ids) still return an
+    actor after it was destroyed, so liveness is read off get_actors().
+    """
+    if world.get_settings().synchronous_mode:
+        world.tick()
+    else:
+        world.wait_for_tick()
+    return {actor.id for actor in world.get_actors()}
 
 
 @pytest.fixture
@@ -90,8 +103,9 @@ def test_node_spawns_ticks_and_cleans_up(node):
 
     settings_before = node._original_settings.synchronous_mode
     node.shutdown()
-    assert world.get_actor(ego_id) is None
-    assert len(world.get_actors(spawned_ids)) == 0
+    alive = _alive_ids(world)
+    assert ego_id not in alive
+    assert alive.isdisjoint(spawned_ids)
     assert world.get_settings().synchronous_mode == settings_before
 
 
@@ -138,8 +152,9 @@ def test_scenario_mode_attaches_to_an_existing_ego():
                 world.wait_for_tick()
             rclpy.spin_once(node, timeout_sec=0.1)
         node.shutdown()
-        assert world.get_actor(ego.id) is not None  # the scenario's ego is left alone
-        assert len(world.get_actors(sensor_ids)) == 0
+        alive = _alive_ids(world)
+        assert ego.id in alive  # the scenario's ego is left alone
+        assert alive.isdisjoint(sensor_ids)
     finally:
         node.destroy_node()
         rclpy.shutdown()
@@ -159,7 +174,7 @@ def test_scenario_mode_uses_the_native_interface_for_a_native_ego():
     world = client.get_world()
     blueprint = world.get_blueprint_library().find("vehicle.lincoln.mkz")
     if not blueprint.has_attribute("ros2_autoware_control"):
-        pytest.skip("the server has no native Autoware interface (start it with -ros2)")
+        pytest.skip("the server has no native Autoware interface (start it with --ros2)")
     blueprint.set_attribute("role_name", "ego")
     blueprint.set_attribute("ros2_autoware_control", "true")
     points = list(world.get_map().get_spawn_points())
@@ -185,7 +200,7 @@ def test_scenario_mode_uses_the_native_interface_for_a_native_ego():
         types = {a.type_id for a in world.get_actors([a.id for a in node._spawned])}
         assert "sensor.other.vehicle_status" in types
         node.shutdown()
-        assert world.get_actor(ego.id) is not None
+        assert ego.id in _alive_ids(world)
     finally:
         node.destroy_node()
         rclpy.shutdown()

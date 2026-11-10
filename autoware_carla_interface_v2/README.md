@@ -3,7 +3,7 @@
 Runs Autoware on [CARLA 1.0](https://github.com/carla-simulator/carla/releases/tag/1.0)
 (Unreal Engine 5.8) through CARLA's native ROS 2 interface.
 
-CARLA 1.0 drives Autoware without a bridge process: started with `-ros2`, the server publishes
+CARLA 1.0 drives Autoware without a bridge process: started with `--ros2`, the server publishes
 the sensor data, `/vehicle/status/*` and `/clock` itself, and applies
 `/control/command/control_cmd` to a vehicle spawned with the `ros2_autoware_control` attribute
 ([CARLA's Autoware page](https://github.com/carla-simulator/carla/blob/1.0/Docs/autoware.md)).
@@ -30,7 +30,7 @@ None of that conversion is needed with CARLA 1.0.
 
 | Ubuntu | ROS 2 |           CARLA           |     CARLA client     | Autoware |
 | :----: | :---: | :-----------------------: | :------------------: | :------: |
-| 24.04  | Jazzy | 1.0, started with `-ros2` | typesafe-carla 0.8.x |  2.0.0   |
+| 24.04  | Jazzy | 1.0, started with `--ros2` | typesafe-carla 0.8.x |  2.0.0   |
 
 ## Install
 
@@ -60,8 +60,11 @@ None of that conversion is needed with CARLA 1.0.
 ## Run
 
 ```bash
-# 1. CARLA with ROS 2 (add -nullrhi to run without a GPU; cameras are then skipped, see below)
-./CarlaUnreal.sh -ros2 -RenderOffScreen -nosound
+# 1. CARLA with ROS 2 (add -nullrhi to run without a GPU; cameras are then skipped, see below).
+#    Two dashes: the server only reads `--ros2`; `-ros2` starts it with ROS 2 off, silently.
+#    -rmw=cyclonedds with Autoware's own Cyclone DDS configuration (the dev container's
+#    ~/cyclonedds.xml, loopback only) is what this was run with.
+CYCLONEDDS_URI=file://$HOME/cyclonedds.xml ./CarlaUnreal.sh --ros2 -rmw=cyclonedds -RenderOffScreen -nosound
 
 # 2. This node: loads the level, spawns the ego and sensors, ticks the world
 ros2 launch autoware_carla_interface_v2 autoware_carla_interface_v2.launch.xml \
@@ -212,7 +215,7 @@ run. `test/test_carla_server.py` runs the node against a real server and is skip
 `CARLA_HOST` is set:
 
 ```bash
-./CarlaUnreal.sh -ros2 -nullrhi -nosound
+./CarlaUnreal.sh --ros2 -nullrhi -nosound
 CARLA_HOST=localhost python3 -m pytest test/test_carla_server.py -s
 ```
 
@@ -237,4 +240,14 @@ as an `int`.
   receives them and does nothing; `control_mode` always reports `AUTONOMOUS`). The client-side
   interface applies reverse and park, and also reports `AUTONOMOUS`.
 - Steering is tuned for the Lincoln MKZ (CARLA's measurement); other vehicles track more loosely.
-- Not yet run against a live CARLA 1.0 server; `test/test_carla_server.py` is that check.
+- Run against the CARLA 1.0 nightly (`ue58-dev` d93dfef63) with Autoware universe 0.53.2 beside
+  autoware_carla_scenario: the node attaches to the scenario's ego, spawns the sensor kit, and
+  Autoware localizes, routes, engages and drives to its goal through both vehicle interfaces.
+  Two server-side fixes are needed with current Autoware:
+  - [carla-simulator/carla#10206](https://github.com/carla-simulator/carla/pull/10206): without it
+    the LiDAR `azimuth` runs against the scan and Autoware 0.53 or later drops every point in its
+    ring outlier filter, so localization never initializes.
+  - [carla-simulator/carla#10216](https://github.com/carla-simulator/carla/pull/10216): without it
+    the native interface receives no command from `control_command_gate` (autoware_launch after
+    0.53.0), so the ego does not move; the client-side interface (`vehicle_interface:=client`)
+    is not affected.
