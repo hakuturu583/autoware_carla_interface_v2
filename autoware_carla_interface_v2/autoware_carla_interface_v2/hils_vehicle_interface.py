@@ -48,9 +48,10 @@ from typing import Callable
 from typing import Optional
 from typing import Tuple
 
+from .transforms import yaw_to_quaternion
 from .vehicle_interface import GEAR_DRIVE
-from .vehicle_interface import GEAR_REVERSE
 from .vehicle_interface import ackermann_values
+from .vehicle_interface import reported_gear
 
 GRAVITY = 9.80665
 #: CARLA's Lincoln MKZ turns its front wheels 70 degrees at full steer.
@@ -90,15 +91,6 @@ def control_cmd_fields(steering_tire_angle, velocity, acceleration, jerk, gear) 
         "SteerAngle": -values["steer"],
         "Jerk": values["jerk"],
     }
-
-
-def gear_report(reverse: int, longitudinal_velocity: float) -> int:
-    return GEAR_REVERSE if reverse or longitudinal_velocity < -0.1 else GEAR_DRIVE
-
-
-def yaw_to_quaternion(yaw: float) -> Tuple[float, float]:
-    """(z, w) of a rotation about z."""
-    return math.sin(yaw / 2.0), math.cos(yaw / 2.0)
 
 
 @dataclass
@@ -216,10 +208,6 @@ def main(args=None):
             self.pub_hazard = pub(HazardLightsReport, "/vehicle/status/hazard_lights_status")
             self.pub_imu = self.create_publisher(Imu, "/sensing/imu/tamagawa/imu_raw", 10)
             self.pub_gnss = pub(PoseWithCovarianceStamped, "/sensing/gnss/pose_with_covariance")
-            self.msgs = dict(
-                velocity=VelocityReport, steering=SteeringReport, gear=GearReport, mode=ControlModeReport,
-                turn=TurnIndicatorsReport, hazard=HazardLightsReport, imu=Imu, gnss=PoseWithCovarianceStamped,
-            )
 
             self.create_subscription(Control, "/control/command/control_cmd", self._on_control, qos, callback_group=group)
             self.create_subscription(GearCommand, "/control/command/gear_cmd", self._on_gear, qos, callback_group=group)
@@ -241,11 +229,6 @@ def main(args=None):
             self.srv_clear = self.create_client(ClearRoute, "/api/routing/clear_route", callback_group=group)
             self.srv_autonomous = self.create_client(ChangeOperationMode, "/api/operation_mode/change_to_autonomous", callback_group=group)
             self.srv_stop = self.create_client(ChangeOperationMode, "/api/operation_mode/change_to_stop", callback_group=group)
-            self.types = dict(
-                InitializeLocalization=InitializeLocalization, SetRoutePoints=SetRoutePoints, ClearRoute=ClearRoute,
-                ChangeOperationMode=ChangeOperationMode, LocalizationInitializationState=LocalizationInitializationState,
-                RouteState=RouteState,
-            )
 
             self.channel = hilspy.open(self.can_url, f"dbc:{self.dbc_file}")
             self.get_logger().info(f"HILS CAN {self.can_url} ({self.dbc_file})")
@@ -318,15 +301,14 @@ def main(args=None):
             elif name == "PowerMode":
                 if fields["Ignition"]:
                     self.ignition_seen = time.monotonic()
-                if bool(fields["Ignition"]) != self.ignition:
-                    self._set_ignition(bool(fields["Ignition"]))
+                self._set_ignition(bool(fields["Ignition"]))
 
         def _publish_imu(self, stamp):
             s = self.state
             if not self.imu_fresh:
                 return
             self.imu_fresh = False
-            imu = self.msgs["imu"]()
+            imu = Imu()
             imu.header.stamp, imu.header.frame_id = stamp, "base_link"
             imu.orientation_covariance[0] = -1.0  # no orientation estimate
             imu.angular_velocity.x = s.roll_rate
@@ -342,25 +324,25 @@ def main(args=None):
             s = self.state
             stamp = self.get_clock().now().to_msg()
             self._publish_imu(stamp)
-            velocity = self.msgs["velocity"]()
+            velocity = VelocityReport()
             velocity.header.stamp, velocity.header.frame_id = stamp, "base_link"
             velocity.longitudinal_velocity = float(s.speed)
             velocity.heading_rate = float(s.yaw_rate)
             self.pub_velocity.publish(velocity)
-            steering = self.msgs["steering"](stamp=stamp)
+            steering = SteeringReport(stamp=stamp)
             steering.steering_tire_angle = tire_angle_from_steer(s.steer, self.max_steer_angle)
             self.pub_steering.publish(steering)
-            self.pub_gear.publish(self.msgs["gear"](stamp=stamp, report=gear_report(s.reverse, s.speed)))
-            self.pub_mode.publish(self.msgs["mode"](stamp=stamp, mode=ControlModeReport.AUTONOMOUS))
-            self.pub_turn.publish(self.msgs["turn"](stamp=stamp, report=TurnIndicatorsReport.DISABLE))
-            self.pub_hazard.publish(self.msgs["hazard"](stamp=stamp, report=HazardLightsReport.DISABLE))
+            self.pub_gear.publish(GearReport(stamp=stamp, report=reported_gear(self.gear_cmd, bool(s.reverse) or s.speed < -0.1)))
+            self.pub_mode.publish(ControlModeReport(stamp=stamp, mode=ControlModeReport.AUTONOMOUS))
+            self.pub_turn.publish(TurnIndicatorsReport(stamp=stamp, report=TurnIndicatorsReport.DISABLE))
+            self.pub_hazard.publish(HazardLightsReport(stamp=stamp, report=HazardLightsReport.DISABLE))
 
         def _gnss_pose(self, stamp):
             s = self.state
             if s.position is None or s.yaw_deg is None:
                 return None
             x, y, z, yaw = map_pose_from_carla(s.position[0], s.position[1], s.z, s.yaw_deg, self.base_link_x)
-            pose = self.msgs["gnss"]()
+            pose = PoseWithCovarianceStamped()
             pose.header.stamp, pose.header.frame_id = stamp, "map"
             pose.pose.pose.position.x, pose.pose.pose.position.y, pose.pose.pose.position.z = x, y, z
             pose.pose.pose.orientation.z, pose.pose.pose.orientation.w = yaw_to_quaternion(yaw)
@@ -419,10 +401,9 @@ def main(args=None):
         def _wait_settled(self, predicate: Callable[[float], bool], hold: float, session) -> bool:
             """Wait until ``predicate`` has held without a break for ``hold`` seconds."""
             settle = Settle(hold)
-            return self._wait(lambda: settle.update(predicate(time.monotonic()), time.monotonic()), session)
+            return self._wait(lambda: settle.update(predicate(now := time.monotonic()), now), session)
 
         def _start_session(self, session):
-            t = self.types
             # Awake: the AD API answers. The bridge attaches the sensors after
             # this, so localization can only start once Ready has gone out.
             services = (self.srv_initialize, self.srv_route, self.srv_autonomous)
@@ -434,19 +415,19 @@ def main(args=None):
             if not self._wait(lambda: self.state.position is not None and self.state.yaw_deg is not None, session):
                 self.get_logger().error("No GNSS pose on the CAN; cannot initialize localization")
                 return
-            request = t["InitializeLocalization"].Request()
+            request = InitializeLocalization.Request()
             pose = self._gnss_pose(self.get_clock().now().to_msg())
             request.pose = [pose]
             if not self._call(self.srv_initialize, request, "localization initialize", session):
                 return
-            initialized = t["LocalizationInitializationState"].INITIALIZED
+            initialized = LocalizationInitializationState.INITIALIZED
             if not self._wait(lambda: self.localization_state == initialized, session):
                 self.get_logger().error("Localization did not initialize")
                 return
             if self.has_goal:
-                if self.route_state != t["RouteState"].UNSET:
-                    self._call(self.srv_clear, t["ClearRoute"].Request(), "clear route", session)
-                route = t["SetRoutePoints"].Request()
+                if self.route_state != RouteState.UNSET:
+                    self._call(self.srv_clear, ClearRoute.Request(), "clear route", session)
+                route = SetRoutePoints.Request()
                 route.header.frame_id = "map"
                 route.header.stamp = self.get_clock().now().to_msg()
                 route.goal.position.x, route.goal.position.y = self.goal[0], self.goal[1]
@@ -457,16 +438,15 @@ def main(args=None):
                 if not self._wait_settled(self._engage_ready, self.engage_settle, session):
                     self.get_logger().error("Autonomous mode never became available")
                     return
-                if not self._call(self.srv_autonomous, t["ChangeOperationMode"].Request(), "change to autonomous", session):
+                if not self._call(self.srv_autonomous, ChangeOperationMode.Request(), "change to autonomous", session):
                     return
             if session == self.session:
                 self.get_logger().info("Autoware engaged")
 
         def _end_session(self, session):
-            t = self.types
-            self._call(self.srv_stop, t["ChangeOperationMode"].Request(), "change to stop", session)
-            if self.route_state not in (t["RouteState"].UNSET, 0):
-                self._call(self.srv_clear, t["ClearRoute"].Request(), "clear route", session)
+            self._call(self.srv_stop, ChangeOperationMode.Request(), "change to stop", session)
+            if self.route_state not in (RouteState.UNSET, 0):
+                self._call(self.srv_clear, ClearRoute.Request(), "clear route", session)
 
         def close(self):
             self.running = False

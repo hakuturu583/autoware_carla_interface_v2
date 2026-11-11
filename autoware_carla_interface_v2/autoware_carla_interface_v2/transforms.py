@@ -89,6 +89,11 @@ def chain(poses: Iterable[Pose]) -> Pose:
     return result
 
 
+
+def yaw_to_quaternion(yaw: float) -> Tuple[float, float]:
+    """(z, w) of a rotation about z."""
+    return math.sin(yaw / 2.0), math.cos(yaw / 2.0)
+
 def quaternion_to_rpy(x: float, y: float, z: float, w: float) -> Tuple[float, float, float]:
     """ROS quaternion to roll, pitch, yaw [rad]."""
     sinr = 2.0 * (w * x + y * z)

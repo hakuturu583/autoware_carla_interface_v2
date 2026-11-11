@@ -181,12 +181,12 @@ What the wall clock needs that sim time hides:
   spinning sensor would (autoware_carla_scenario `fix/hils-lidar-capture-timestamp`); dated by
   their send the scans were ~94 ms older than their stamps.
 - The LiDAR needs hilspy's continuous pacing (back-to-back revolutions on a fixed 100 ms
-  schedule); with hilspy 0.17 the revolutions drift to ~100.2 ms.
+  schedule), hilspy 0.17.1 or later; with 0.17.0 the revolutions drift to ~100.2 ms.
 
 ```bash
 # Once: the CAN (or `scenario-hils config/hils/scenario-hils.yaml --setup`)
 sudo ip link add dev vcan0 type vcan && sudo ip link set up vcan0
-pip install "hilspy>=0.17,<0.18"          # the vehicle interface's CAN
+pip install "hilspy>=0.17.1,<0.18"        # the vehicle interface's CAN (and the bridge's: 0.17.1 paces LiDAR continuously)
 
 # The bridge, resident (autoware_carla_scenario[hils]); CARLA 1.0 needs typesafe-carla 0.8.7
 TYPESAFE_CARLA_CARLA_REF=1.0 scenario-hils config/hils/scenario-hils.yaml

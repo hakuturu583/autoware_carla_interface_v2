@@ -22,11 +22,12 @@ import pytest
 from autoware_carla_interface_v2.hils_vehicle_interface import MKZ_MAX_STEER_ANGLE
 from autoware_carla_interface_v2.hils_vehicle_interface import Settle
 from autoware_carla_interface_v2.hils_vehicle_interface import control_cmd_fields
-from autoware_carla_interface_v2.hils_vehicle_interface import gear_report
 from autoware_carla_interface_v2.hils_vehicle_interface import map_pose_from_carla
 from autoware_carla_interface_v2.hils_vehicle_interface import tire_angle_from_steer
 from autoware_carla_interface_v2.vehicle_interface import GEAR_DRIVE
+from autoware_carla_interface_v2.vehicle_interface import GEAR_PARK
 from autoware_carla_interface_v2.vehicle_interface import GEAR_REVERSE
+from autoware_carla_interface_v2.vehicle_interface import reported_gear
 
 DBC = os.path.join(os.path.dirname(__file__), "..", "config", "hils", "carla_autoware.dbc")
 
@@ -57,10 +58,10 @@ def test_control_cmd_reverses_the_target_speed_in_reverse():
     assert control_cmd_fields(0.0, 2.0, 0.5, 0.0, GEAR_REVERSE)["TargetSpeed"] == pytest.approx(-2.0)
 
 
-def test_gear_report_follows_reverse_and_backward_motion():
-    assert gear_report(0, 1.0) == GEAR_DRIVE
-    assert gear_report(1, 0.0) == GEAR_REVERSE
-    assert gear_report(0, -0.5) == GEAR_REVERSE
+def test_reported_gear_follows_reverse_and_park():
+    assert reported_gear(GEAR_DRIVE, False) == GEAR_DRIVE
+    assert reported_gear(GEAR_DRIVE, True) == GEAR_REVERSE
+    assert reported_gear(GEAR_PARK, False) == GEAR_PARK
 
 
 def test_the_dbc_round_trips_the_messages_the_bridge_and_the_node_exchange():
