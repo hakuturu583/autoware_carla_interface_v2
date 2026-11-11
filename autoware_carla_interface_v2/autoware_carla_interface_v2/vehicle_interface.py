@@ -37,6 +37,11 @@ GEAR_PARK = 22
 GEAR_NEUTRAL = 1
 
 
+
+def reported_gear(commanded: int, reverse: bool) -> int:
+    """The GearReport for the commanded gear: reverse when backing, park when parked, else drive."""
+    return GEAR_REVERSE if reverse else (commanded if commanded == GEAR_PARK else GEAR_DRIVE)
+
 def ackermann_values(steering_tire_angle, velocity, acceleration, jerk, gear) -> dict:
     """Autoware Control (+ gear) as VehicleAckermannControl fields.
 
@@ -193,8 +198,7 @@ class ClientSideVehicleInterface:
         )
         self._pubs["steering"].publish(steering)
 
-        reverse = self._gear == GEAR_REVERSE or longitudinal < -0.1
-        gear = GEAR_REVERSE if reverse else (self._gear if self._gear == GEAR_PARK else GEAR_DRIVE)
+        gear = reported_gear(self._gear, self._gear == GEAR_REVERSE or longitudinal < -0.1)
         self._pubs["gear"].publish(self._msgs["gear"](stamp=stamp, report=gear))
         self._pubs["control_mode"].publish(
             self._msgs["control_mode"](stamp=stamp, mode=self._msgs["control_mode"].AUTONOMOUS)
