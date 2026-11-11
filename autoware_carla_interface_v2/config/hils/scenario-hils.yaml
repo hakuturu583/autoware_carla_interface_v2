@@ -51,20 +51,25 @@ devices:
           steer: {field: SteerAngle, scale: -1.0}   # left-positive -> CARLA's right
           jerk: {field: Jerk}
 
-  # A Velodyne VLP-16 where the AWSIM sensor kit has velodyne_top
+  # A Hesai Pandar XT32 where the AWSIM sensor kit has velodyne_top
   # (base_link -> sensor_kit_base_link -> velodyne_top, in CARLA's vehicle frame).
+  # 32 channels at 1 deg (twice the VLP-16's): NDT on the VLP-16's ~700
+  # downsampled points oscillated in local minima and its WARN dropped Autoware
+  # into MRMs. A Hesai's own frame has y forward (nebula keeps it), so the
+  # CARLA sensor is turned so that its x is velodyne_top's y: velodyne_top's
+  # (roll 0.8597, pitch -0.0537, yaw -88.1561) composed with a 90 deg yaw.
   lidar_top:
     url: udp://127.0.0.1:2368
-    codec: lidar:vlp16
+    codec: lidar:pandar_xt32
     sensor:
       blueprint: sensor.lidar.ray_cast
-      transform: {x: -0.49707, y: 0.0, z: 2.0, roll: 0.8597, pitch: -0.0537, yaw: -88.1561}
+      transform: {x: -0.49707, y: 0.0, z: 2.0, roll: 0.0537, pitch: 0.8597, yaw: -178.1553}
       attributes:
-        channels: 16
-        range: 100
+        channels: 32
+        range: 120
         upper_fov: 15
-        lower_fov: -15
-        points_per_second: 300000
+        lower_fov: -16
+        points_per_second: 640000
         rotation_frequency: 10
         dropoff_general_rate: 0.0
         dropoff_zero_intensity: 0.0

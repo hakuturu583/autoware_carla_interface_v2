@@ -153,13 +153,28 @@ Autoware is that ECU and sees only the car's interfaces, never CARLA:
 
 | Path | Bridge (`config/hils/scenario-hils.yaml`) | Autoware |
 | --- | --- | --- |
-| LiDAR | a ray-cast LiDAR where `velodyne_top` is, sent as a Velodyne VLP-16's UDP packets to `127.0.0.1:2368` | nebula's Velodyne driver (`velodyne_points` → `/sensing/lidar/top/pointcloud_raw_ex`) |
+| LiDAR | a ray-cast LiDAR where `velodyne_top` is, sent as a Hesai Pandar XT32's UDP packets to `127.0.0.1:2368` (10 Hz, 64 000 points a revolution) | nebula's Hesai driver (`pandar_points` → `/sensing/lidar/top/pointcloud_raw_ex`) |
 | Vehicle CAN (`vcan0`, `config/hils/carla_autoware.dbc`) | `VehicleStatus`, `ImuData` (100 Hz), `GnssPosition` / `GnssAttitude` (the ego's pose, as a simulated GNSS) | `hils_vehicle_interface`: `/vehicle/status/*`, the IMU, `/sensing/gnss/pose_with_covariance` |
 | | `ControlCmd` → CARLA Ackermann control (`commands.mode: ackermann`) | `/control/command/control_cmd` → `ControlCmd` (50 Hz) |
 | Lifecycle | `PowerMode.Ignition` on while a scenario runs; `scenario_start` waits for `EcuStatus.Ready` | Ready once the AD API is up; then, with the sensors streaming, initialize localization at the GNSS pose, set the route to `goal_x/y/yaw`, engage |
 
 Autoware runs on its own clock (`use_sim_time:=false`) and the bridge on `clock: wall`, as an ECU
 would. The ECU only learns the goal from `goal_*`; a car's ECU gets it from its operator.
+
+What the wall clock needs that sim time hides:
+
+- The EKF keeps each NDT pose for `pose_smoothing_steps` ticks of its 50 Hz timer; upstream's 5 is
+  exactly one 10 Hz LiDAR period, so any lateness of the next pose empties the queue for a tick
+  and the EKF's "pose topic is delay" WARN drops Autoware into an MRM. The launch passes
+  `config/hils/ekf_localizer.param.yaml` (7 steps) instead (`ekf_param_path`).
+- `hils_vehicle_interface` engages only once autonomous mode has stayed available, with the
+  trajectory follower's command flowing, for `engage_settle_s` (2 s): right after localization
+  initializes the mode flickers available before the controller runs.
+- The LiDAR is an XT32 rather than a VLP-16: on the VLP-16's ~700 downsampled points NDT
+  oscillated in local minima, and its WARN is an MRM too. A Hesai's frame has y forward, so the
+  bridge turns the CARLA sensor 90 degrees from `velodyne_top` (see the config's comment).
+- The LiDAR needs hilspy's continuous pacing (back-to-back revolutions on a fixed 100 ms
+  schedule); with hilspy 0.17 the revolutions drift to ~100.2 ms.
 
 ```bash
 # Once: the CAN (or `scenario-hils config/hils/scenario-hils.yaml --setup`)
@@ -179,12 +194,11 @@ TYPESAFE_CARLA_CARLA_REF=1.0 uv run scenario scenario=intersection_passing/right
     ego.entity=hils hils.ready_timeout_s=180 server.max_tick_rate_hz=20
 ```
 
-Run on Town10HD_Opt (CARLA 1.0 nightly, Autoware universe 0.53.2): Autoware localizes from the
-VLP-16 packets (about 22 900 points a scan from nebula, 943 into NDT), routes, engages and
-drives the ego about 90 m to its goal at up to 4.3 m/s. Known so far: the drive stops and
-pulls away a few times on the way (planning_validator rejects a trajectory "too far from ego in
-longitudinal direction" twice) and ends about 4 m past the goal, as the client-side interface's
-Ackermann control does.
+Run on Town10HD_Opt (CARLA 1.0 nightly): Autoware localizes from the XT32 packets, routes,
+engages and drives the ego about 90 m to its goal at up to 4.2 m/s. Known so far: one MRM
+(comfortable stop, then on again) at the right-turn intersection, from NDT's
+`scan_matching_status` WARN (iteration limit, oscillation), and the drive ends about 6 m past
+the goal.
 
 ## Parameters
 

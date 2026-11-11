@@ -9,7 +9,7 @@
 
     Autoware gets only what a car would give it: the vehicle CAN
     (config/hils/carla_autoware.dbc, through hils_vehicle_interface) and the
-    VLP-16's UDP packets, decoded by Autoware's own LiDAR driver (nebula).
+    Pandar XT32's UDP packets, decoded by Autoware's own LiDAR driver (nebula).
   -->
   <arg name="map_path" description="Autoware map directory of the scenario's level"/>
   <arg name="vehicle_model" default="sample_vehicle"/>
@@ -17,7 +17,7 @@
   <arg name="data_path" default="$(env HOME)/autoware_data/ml_models"/>
   <arg name="rviz" default="false"/>
   <arg name="can_url" default="can://vcan0" description="The vehicle CAN the bridge writes (scenario-hils.yaml's vehicle_can)"/>
-  <arg name="lidar_host_ip" default="127.0.0.1" description="Where the VLP-16 packets arrive"/>
+  <arg name="lidar_host_ip" default="127.0.0.1" description="Where the LiDAR packets arrive"/>
   <arg name="lidar_sensor_ip" default="127.0.0.1" description="Where they come from (the bridge)"/>
   <arg name="lidar_data_port" default="2368"/>
   <arg name="goal_set" default="false" description="Set a route to goal_x/y/yaw when the ignition comes on"/>
@@ -28,21 +28,25 @@
   <arg name="ekf_param_path" default="$(find-pkg-share autoware_carla_interface_v2)/config/hils/ekf_localizer.param.yaml"
        description="EKF parameters; the HILS one keeps each NDT pose a little longer than one LiDAR period"/>
 
-  <!-- The LiDAR: Autoware's own driver, on the bridge's VLP-16 packets -->
+  <!-- The LiDAR: Autoware's own driver, on the bridge's Pandar XT32 packets -->
   <group>
     <push-ros-namespace namespace="/sensing/lidar/top"/>
-    <node pkg="nebula_velodyne" exec="velodyne_ros_wrapper_node" name="velodyne_ros_wrapper_node" output="screen">
-      <param from="$(find-pkg-share nebula_velodyne)/config/VLP16.param.yaml" allow_substs="true"/>
+    <node pkg="nebula_hesai" exec="hesai_ros_wrapper_node" name="hesai_ros_wrapper_node" output="screen">
+      <param from="$(find-pkg-share nebula_hesai)/config/PandarXT32.param.yaml" allow_substs="true"/>
       <param name="host_ip" value="$(var lidar_host_ip)"/>
       <param name="sensor_ip" value="$(var lidar_sensor_ip)"/>
       <param name="data_port" value="$(var lidar_data_port)"/>
+      <!-- Points in the Hesai frame (y forward); the bridge mounts the sensor so that this is velodyne_top -->
       <param name="frame_id" value="velodyne_top"/>
       <param name="launch_hw" value="true"/>
       <param name="setup_sensor" value="false"/>
       <param name="udp_only" value="true"/>
-      <param name="return_mode" value="SingleStrongest"/>
-      <!-- velodyne_points is PointXYZIRCAEDT, what Autoware's preprocessing reads (aw_points_ex is the older XYZIRADRT) -->
-      <remap from="velodyne_points" to="pointcloud_raw_ex"/>
+      <param name="calibration_download_enabled" value="false"/>
+      <!-- Explicit: the param file's $(var sensor_model) would pick up this launch's sensor kit name -->
+      <param name="calibration_file" value="$(find-pkg-share nebula_hesai_decoders)/calibration/PandarXT32.csv"/>
+      <param name="return_mode" value="Strongest"/>
+      <!-- pandar_points is PointXYZIRCAEDT, what Autoware's preprocessing reads -->
+      <remap from="pandar_points" to="pointcloud_raw_ex"/>
     </node>
   </group>
 
