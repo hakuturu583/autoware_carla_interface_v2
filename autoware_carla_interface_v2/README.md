@@ -37,23 +37,21 @@ None of that conversion is needed with CARLA 1.0.
 1. **CARLA 1.0**: download `CARLA_1.0.tar.gz` from the
    [release](https://github.com/carla-simulator/carla/releases/tag/1.0). The official `carla`
    Python package is not needed.
-2. **typesafe_carla** is the rosdep key `python3-typesafe-carla-pip`, which rosdistro does not
-   have yet. Add this repository's definition once:
-
-   ```bash
-   echo "yaml https://raw.githubusercontent.com/hakuturu583/autoware_carla_interface_v2/main/rosdep/typesafe_carla.yaml" \
-     | sudo tee /etc/ros/rosdep/sources.list.d/50-typesafe-carla.list
-   rosdep update
-   ```
-
-   or install it directly: `pip install "typesafe-carla>=0.8.7,<0.9"` (add
-   `--break-system-packages` for Ubuntu 24.04's system Python). The wheel carries LibCarla built
-   for CARLA 1.0, so nothing is compiled.
+2. **typesafe_carla** is rosdistro's rosdep key `python3-typesafe-carla-pip`, so the
+   `rosdep install` below installs it with pip. On Ubuntu 24.04 (PEP 668) run rosdep from the
+   workspace's Python venv, as Autoware sets it up
+   ([`python_venv` role](https://github.com/autowarefoundation/autoware/tree/main/ansible/roles/python_venv),
+   `/opt/autoware-venv` in its Docker images), so pip installs into the venv; rosdep 0.27.0 or
+   later is needed for it to accept a venv in place of `PIP_BREAK_SYSTEM_PACKAGES`. The wheel carries LibCarla built for CARLA 1.0,
+   so nothing is compiled. The key is not pinned: it installs the latest release, and this
+   package is written against 0.8.x (0.8.7 or later). To pin it, install it yourself and skip
+   the key: `pip install "typesafe-carla>=0.8.7,<0.9"` (add `--break-system-packages` for
+   Ubuntu 24.04's system Python), then `rosdep install ... --skip-keys python3-typesafe-carla-pip`.
 
 3. Build:
 
    ```bash
-   rosdep install --from-paths src --ignore-src -y
+   rosdep install --from-paths src --ignore-src -y --as-root pip:false   # from the venv
    colcon build --packages-up-to autoware_carla_interface_v2
    ```
 

@@ -24,8 +24,10 @@ differences from the Autoware Universe package.
 mkdir -p ~/carla_ws/src && cd ~/carla_ws/src
 git clone https://github.com/hakuturu583/autoware_carla_interface_v2.git
 cd ~/carla_ws
-pip install "typesafe-carla>=0.8.7,<0.9"   # or use rosdep/typesafe_carla.yaml
-rosdep install --from-paths src --ignore-src -y --skip-keys python3-typesafe-carla-pip
+# typesafe_carla comes from rosdistro's python3-typesafe-carla-pip, a pip key. Run rosdep from
+# the workspace's Python venv (Autoware's python_venv role, or /opt/autoware-venv in its images)
+# so pip installs into it; --as-root pip:false keeps rosdep from running the system pip with sudo.
+rosdep install --from-paths src --ignore-src -y --as-root pip:false
 colcon build --packages-up-to autoware_carla_interface_v2
 ```
 
