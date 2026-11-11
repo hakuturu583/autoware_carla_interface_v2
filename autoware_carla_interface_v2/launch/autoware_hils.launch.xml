@@ -25,6 +25,8 @@
   <arg name="goal_y" default="0.0"/>
   <arg name="goal_yaw" default="0.0"/>
   <arg name="auto_engage" default="true"/>
+  <arg name="ekf_param_path" default="$(find-pkg-share autoware_carla_interface_v2)/config/hils/ekf_localizer.param.yaml"
+       description="EKF parameters; the HILS one keeps each NDT pose a little longer than one LiDAR period"/>
 
   <!-- The LiDAR: Autoware's own driver, on the bridge's VLP-16 packets -->
   <group>
@@ -55,6 +57,8 @@
   </node>
 
   <!-- Autoware, without a simulator interface: the vehicle is on the CAN -->
+  <!-- Read by pose_twist_fusion_filter.launch.xml, which the localization component includes without arguments -->
+  <let name="ekf_localizer_param_path" value="$(var ekf_param_path)"/>
   <include file="$(find-pkg-share autoware_launch)/launch/e2e_simulator.launch.xml">
     <arg name="map_path" value="$(var map_path)"/>
     <arg name="vehicle_model" value="$(var vehicle_model)"/>
