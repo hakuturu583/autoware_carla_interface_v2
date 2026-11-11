@@ -19,6 +19,10 @@ BO_ 257 ImuData: 8 SIM
  SG_ AccelY : 32|16@1- (0.001,0) [-32.768|32.767] "m/s2" ADS
  SG_ AccelZ : 48|16@1- (0.001,0) [-32.768|32.767] "m/s2" ADS
 
+BO_ 260 ImuRates: 8 SIM
+ SG_ RollRate : 0|16@1- (0.0001,0) [-3.2768|3.2767] "rad/s" ADS
+ SG_ PitchRate : 16|16@1- (0.0001,0) [-3.2768|3.2767] "rad/s" ADS
+
 BO_ 258 GnssPosition: 8 SIM
  SG_ X : 0|32@1- (0.001,0) [-2147483.648|2147483.647] "m" ADS
  SG_ Y : 32|32@1- (0.001,0) [-2147483.648|2147483.647] "m" ADS
@@ -41,6 +45,7 @@ BO_ 528 EcuStatus: 8 ADS
  SG_ Engaged : 1|1@1+ (1,0) [0|1] "" SIM
 
 CM_ BO_ 256 "Ego state, from scenario-hils signals: Speed = longitudinal_velocity, Steer = CARLA steer (positive right).";
+CM_ BO_ 260 "The IMU's roll and pitch rates (vehicle frame, x forward, y left, right-handed), beside ImuData's yaw rate.";
 CM_ BO_ 258 "Simulated GNSS: the ego's CARLA x/y (vehicle origin), in metres.";
 CM_ BO_ 259 "Simulated GNSS: CARLA z and yaw (degrees, clockwise seen from above).";
 CM_ BO_ 512 "Autoware control_cmd as CARLA Ackermann control: TargetSpeed signed (negative = reverse), SteerAngle left-positive tire angle.";

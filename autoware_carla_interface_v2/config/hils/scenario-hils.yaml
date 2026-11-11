@@ -32,6 +32,14 @@ devices:
           AccelX: $longitudinal_acceleration
           AccelY: $lateral_acceleration
           AccelZ: {signal: vertical_acceleration, offset: 9.80665}
+      # Roll and pitch rates: the EKF turns NDT's roll/pitch forward over the
+      # scan's delay with them; without them its initial guess lags the body's
+      # pitching by that delay and NDT oscillates.
+      - name: ImuRates
+        period: 0.01
+        fields:
+          RollRate: {signal: roll_rate, scale: 0.017453292519943295}
+          PitchRate: {signal: pitch_rate, scale: 0.017453292519943295}
       # A simulated GNSS: the ego's pose, which Autoware initializes from.
       - name: GnssPosition
         period: 0.1

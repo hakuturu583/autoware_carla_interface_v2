@@ -21,7 +21,7 @@ VLP-16's UDP packets, which Autoware's own LiDAR driver (nebula) decodes. This
 node is the vehicle interface on Autoware's side of that CAN, as it would be in
 a car:
 
-- ``VehicleStatus``, ``ImuData``, ``GnssPosition`` / ``GnssAttitude`` (the
+- ``VehicleStatus``, ``ImuData``, ``ImuRates``, ``GnssPosition`` / ``GnssAttitude`` (the
   simulated GNSS: the ego's pose) become ``/vehicle/status/*``, the IMU and the
   GNSS pose Autoware localizes from;
 - ``/control/command/control_cmd`` goes back as ``ControlCmd``, Autoware's
@@ -107,6 +107,8 @@ class EgoState:
     steer: float = 0.0
     reverse: int = 0
     yaw_rate: float = 0.0
+    roll_rate: float = 0.0
+    pitch_rate: float = 0.0
     accel: Tuple[float, float, float] = (0.0, 0.0, GRAVITY)
     position: Optional[Tuple[float, float]] = None
     z: float = 0.0
@@ -307,6 +309,8 @@ def main(args=None):
                 s.yaw_rate = fields["YawRate"]
                 s.accel = (fields["AccelX"], fields["AccelY"], fields["AccelZ"])
                 self.imu_fresh = True
+            elif name == "ImuRates":
+                s.roll_rate, s.pitch_rate = fields["RollRate"], fields["PitchRate"]
             elif name == "GnssPosition":
                 s.position = (fields["X"], fields["Y"])
             elif name == "GnssAttitude":
@@ -325,6 +329,8 @@ def main(args=None):
             imu = self.msgs["imu"]()
             imu.header.stamp, imu.header.frame_id = stamp, "base_link"
             imu.orientation_covariance[0] = -1.0  # no orientation estimate
+            imu.angular_velocity.x = s.roll_rate
+            imu.angular_velocity.y = s.pitch_rate
             imu.angular_velocity.z = s.yaw_rate
             imu.linear_acceleration.x, imu.linear_acceleration.y, imu.linear_acceleration.z = s.accel
             for i in (0, 4, 8):
