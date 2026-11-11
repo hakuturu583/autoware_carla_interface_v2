@@ -114,6 +114,22 @@ class EgoState:
 
 
 # ------------------------------------------------------------------ node
+class Settle:
+    """True once a condition has held without a break for ``hold`` seconds."""
+
+    def __init__(self, hold: float):
+        self.hold = hold
+        self.since: Optional[float] = None
+
+    def update(self, ok: bool, now: float) -> bool:
+        if not ok:
+            self.since = None
+            return False
+        if self.since is None:
+            self.since = now
+        return now - self.since >= self.hold
+
+
 def _package_file(*parts) -> str:
     from ament_index_python.packages import get_package_share_directory
 
@@ -166,6 +182,12 @@ def main(args=None):
             self.ignition_timeout = p("ignition_timeout_s", 2.0).value
             self.status_rate = p("status_rate_hz", 50.0).value
             self.step_timeout = p("step_timeout_s", 120.0).value
+            # Engage only once the controller's command has been flowing and
+            # autonomous mode has stayed available this long: right after
+            # localization the mode flickers available while the controller is
+            # still silent, and engaging then times the command source out
+            # into an MRM.
+            self.engage_settle = p("engage_settle_s", 2.0).value
 
             self.state = EgoState()
             self.lock = threading.Lock()
@@ -177,6 +199,7 @@ def main(args=None):
             self.localization_state = 0
             self.route_state = 0
             self.operation_mode: Optional[OperationModeState] = None
+            self.follower_seen = 0.0  # monotonic time of the last trajectory follower command
             self.session = 0  # bumped at every ignition edge; a stale operator gives up
 
             group = ReentrantCallbackGroup()
@@ -198,6 +221,9 @@ def main(args=None):
 
             self.create_subscription(Control, "/control/command/control_cmd", self._on_control, qos, callback_group=group)
             self.create_subscription(GearCommand, "/control/command/gear_cmd", self._on_gear, qos, callback_group=group)
+            self.create_subscription(
+                Control, "/control/trajectory_follower/control_cmd", self._on_follower, qos, callback_group=group
+            )
             self.create_subscription(
                 LocalizationInitializationState, "/api/localization/initialization_state",
                 lambda m: setattr(self, "localization_state", m.state), latched, callback_group=group)
@@ -377,6 +403,18 @@ def main(args=None):
                 time.sleep(0.1)
             return False
 
+        def _on_follower(self, _msg):
+            self.follower_seen = time.monotonic()
+
+        def _engage_ready(self, now: float) -> bool:
+            available = bool(self.operation_mode and self.operation_mode.is_autonomous_mode_available)
+            return available and now - self.follower_seen < 0.5
+
+        def _wait_settled(self, predicate: Callable[[float], bool], hold: float, session) -> bool:
+            """Wait until ``predicate`` has held without a break for ``hold`` seconds."""
+            settle = Settle(hold)
+            return self._wait(lambda: settle.update(predicate(time.monotonic()), time.monotonic()), session)
+
         def _start_session(self, session):
             t = self.types
             # Awake: the AD API answers. The bridge attaches the sensors after
@@ -410,7 +448,7 @@ def main(args=None):
                 if not self._call(self.srv_route, route, "route set", session):
                     return
             if self.auto_engage:
-                if not self._wait(lambda: bool(self.operation_mode and self.operation_mode.is_autonomous_mode_available), session):
+                if not self._wait_settled(self._engage_ready, self.engage_settle, session):
                     self.get_logger().error("Autonomous mode never became available")
                     return
                 if not self._call(self.srv_autonomous, t["ChangeOperationMode"].Request(), "change to autonomous", session):

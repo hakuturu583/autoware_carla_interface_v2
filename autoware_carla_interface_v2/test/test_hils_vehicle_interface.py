@@ -20,6 +20,7 @@ import os
 import pytest
 
 from autoware_carla_interface_v2.hils_vehicle_interface import MKZ_MAX_STEER_ANGLE
+from autoware_carla_interface_v2.hils_vehicle_interface import Settle
 from autoware_carla_interface_v2.hils_vehicle_interface import control_cmd_fields
 from autoware_carla_interface_v2.hils_vehicle_interface import gear_report
 from autoware_carla_interface_v2.hils_vehicle_interface import map_pose_from_carla
@@ -73,3 +74,15 @@ def test_the_dbc_round_trips_the_messages_the_bridge_and_the_node_exchange():
     assert control.fields["SteerAngle"] == pytest.approx(-0.1234, abs=1e-4)
     assert control.fields["TargetSpeed"] == pytest.approx(4.2, abs=0.01)
     assert gnss.fields == pytest.approx({"X": -107.39, "Y": 58.15}, abs=1e-3)
+
+
+def test_settle_needs_the_condition_to_hold_unbroken():
+    settle = Settle(2.0)
+    assert not settle.update(True, 10.0)
+    assert not settle.update(True, 11.9)
+    assert settle.update(True, 12.0)
+    # A single break (the mode flickering unavailable) starts the wait over.
+    assert not settle.update(False, 12.1)
+    assert not settle.update(True, 12.2)
+    assert not settle.update(True, 14.1)
+    assert settle.update(True, 14.2)
