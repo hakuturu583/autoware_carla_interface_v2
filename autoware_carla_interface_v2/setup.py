@@ -13,6 +13,7 @@ setup(
         ("share/ament_index/resource_index/packages", ["resource/" + package_name]),
         ("share/" + package_name, ["package.xml"]),
         ("share/" + package_name + "/config", glob("config/*.yaml")),
+        ("share/" + package_name + "/config/hils", glob("config/hils/*")),
         ("share/" + package_name + "/launch", glob("launch/*.launch.xml")),
     ],
     install_requires=["setuptools"],
@@ -26,6 +27,7 @@ setup(
         "console_scripts": [
             "autoware_carla_interface_v2 = autoware_carla_interface_v2.node:main",
             "spectator_follow = autoware_carla_interface_v2.spectator_follow:main",
+            "hils_vehicle_interface = autoware_carla_interface_v2.hils_vehicle_interface:main",
         ],
     },
 )

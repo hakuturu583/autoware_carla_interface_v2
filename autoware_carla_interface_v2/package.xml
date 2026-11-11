@@ -10,15 +10,18 @@
   <url type="bugtracker">https://github.com/hakuturu583/autoware_carla_interface_v2/issues</url>
 
   <exec_depend>ament_index_python</exec_depend>
+  <exec_depend>autoware_adapi_v1_msgs</exec_depend>
   <exec_depend>autoware_control_msgs</exec_depend>
   <exec_depend>autoware_launch</exec_depend>
   <exec_depend>autoware_perception_msgs</exec_depend>
   <exec_depend>autoware_vehicle_msgs</exec_depend>
   <exec_depend>builtin_interfaces</exec_depend>
   <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>nebula_velodyne</exec_depend>
   <exec_depend>python3-typesafe-carla-pip</exec_depend>
   <exec_depend>python3-yaml</exec_depend>
   <exec_depend>rclpy</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
 
   <test_depend>python3-pytest</test_depend>
 

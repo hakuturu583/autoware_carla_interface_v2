@@ -145,6 +145,47 @@ which CARLA does not serve, and the node provides the interface from the client
 `ego_wait_timeout`, `vehicle_interface`, `no_rendering_mode`, `traffic_light.publish` (`true`,
 matched against `map_path/lanelet2_map.osm`), `map_origin_x`, `map_origin_y`.
 
+## HILS: Autoware as the ECU under test
+
+autoware_carla_scenario's HILS bridge (`scenario-hils`, its `docs/hils.md`) follows the ego of a
+run and sends what a car's buses and sensors would. With `launch/autoware_hils.launch.xml`
+Autoware is that ECU and sees only the car's interfaces, never CARLA:
+
+| Path | Bridge (`config/hils/scenario-hils.yaml`) | Autoware |
+| --- | --- | --- |
+| LiDAR | a ray-cast LiDAR where `velodyne_top` is, sent as a Velodyne VLP-16's UDP packets to `127.0.0.1:2368` | nebula's Velodyne driver (`velodyne_points` → `/sensing/lidar/top/pointcloud_raw_ex`) |
+| Vehicle CAN (`vcan0`, `config/hils/carla_autoware.dbc`) | `VehicleStatus`, `ImuData` (100 Hz), `GnssPosition` / `GnssAttitude` (the ego's pose, as a simulated GNSS) | `hils_vehicle_interface`: `/vehicle/status/*`, the IMU, `/sensing/gnss/pose_with_covariance` |
+| | `ControlCmd` → CARLA Ackermann control (`commands.mode: ackermann`) | `/control/command/control_cmd` → `ControlCmd` (50 Hz) |
+| Lifecycle | `PowerMode.Ignition` on while a scenario runs; `scenario_start` waits for `EcuStatus.Ready` | Ready once the AD API is up; then, with the sensors streaming, initialize localization at the GNSS pose, set the route to `goal_x/y/yaw`, engage |
+
+Autoware runs on its own clock (`use_sim_time:=false`) and the bridge on `clock: wall`, as an ECU
+would. The ECU only learns the goal from `goal_*`; a car's ECU gets it from its operator.
+
+```bash
+# Once: the CAN (or `scenario-hils config/hils/scenario-hils.yaml --setup`)
+sudo ip link add dev vcan0 type vcan && sudo ip link set up vcan0
+pip install "hilspy>=0.17,<0.18"          # the vehicle interface's CAN
+
+# The bridge, resident (autoware_carla_scenario[hils]); CARLA 1.0 needs typesafe-carla 0.8.7
+TYPESAFE_CARLA_CARLA_REF=1.0 scenario-hils config/hils/scenario-hils.yaml
+
+# Autoware, resident
+ros2 launch autoware_carla_interface_v2 autoware_hils.launch.xml map_path:=$HOME/autoware_data/maps/Town10HD_Opt \
+    goal_set:=true goal_x:=-107.39 goal_y:=-58.15 goal_yaw:=1.5596
+
+# A run with the ego driven over HILS
+TYPESAFE_CARLA_CARLA_REF=1.0 uv run scenario scenario=intersection_passing/right_turn_sweep map=town10hd_opt \
+    ego.spawn_lanelet_id=1281 ego.spawn_s=5.0 ego.vehicle_type=vehicle.lincoln.mkz \
+    ego.entity=hils hils.ready_timeout_s=180 server.max_tick_rate_hz=20
+```
+
+Run on Town10HD_Opt (CARLA 1.0 nightly, Autoware universe 0.53.2): Autoware localizes from the
+VLP-16 packets (about 22 900 points a scan from nebula, 943 into NDT), routes, engages and
+drives the ego about 90 m to its goal at up to 4.3 m/s. Known so far: the drive stops and
+pulls away a few times on the way (planning_validator rejects a trajectory "too far from ego in
+longitudinal direction" twice) and ends about 4 m past the goal, as the client-side interface's
+Ackermann control does.
+
 ## Parameters
 
 | Name                                                        | Default                                                          | Description                                                                                                                             |

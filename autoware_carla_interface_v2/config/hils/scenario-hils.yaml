@@ -1,0 +1,90 @@
+# scenario-hils configuration (autoware_carla_scenario, docs/hils.md) for
+# Autoware as the ECU: launch/autoware_hils.launch.xml on this PC.
+#
+#   scenario-hils scenario-hils.yaml              (resident)
+#   uv run scenario ego.entity=hils hils.host=<this PC> ...
+#
+# Needs vcan0: `scenario-hils scenario-hils.yaml --setup` creates it, or
+#   sudo ip link add dev vcan0 type vcan && sudo ip link set up vcan0
+
+carla: {host: localhost, port: 2000, timeout: 10.0}
+ego: {role_name: Ego, wait: 120.0}
+runner: {listen: "0.0.0.0:7700"}
+# Autoware's control_cmd is a target speed, acceleration and tire angle:
+# CARLA's Ackermann control applies it as it is.
+commands: {mode: ackermann}
+# Autoware runs on its own (wall) clock, as an ECU does.
+clock: wall
+
+devices:
+  vehicle_can:
+    url: can://vcan0
+    codec: dbc:carla_autoware.dbc
+    messages:
+      - name: VehicleStatus
+        period: 0.01
+        fields: {Speed: $longitudinal_velocity, Steer: $steer, Gear: $gear,
+                 Reverse: $reverse, HandBrake: $hand_brake}
+      - name: ImuData
+        period: 0.01
+        fields:
+          YawRate: $yaw_rate_rad
+          AccelX: $longitudinal_acceleration
+          AccelY: $lateral_acceleration
+          AccelZ: {signal: vertical_acceleration, offset: 9.80665}
+      # A simulated GNSS: the ego's pose, which Autoware initializes from.
+      - name: GnssPosition
+        period: 0.1
+        fields: {X: $x, Y: $y}
+      - name: GnssAttitude
+        period: 0.1
+        fields: {Z: $z, Yaw: $yaw}
+      # On while a scenario runs; scenario_end sends it off.
+      - name: PowerMode
+        period: 0.1
+        fields: {Ignition: 1}
+    inputs:
+      - name: ControlCmd
+        command:
+          speed: {field: TargetSpeed}
+          acceleration: {field: Accel}
+          steer: {field: SteerAngle, scale: -1.0}   # left-positive -> CARLA's right
+          jerk: {field: Jerk}
+
+  # A Velodyne VLP-16 where the AWSIM sensor kit has velodyne_top
+  # (base_link -> sensor_kit_base_link -> velodyne_top, in CARLA's vehicle frame).
+  lidar_top:
+    url: udp://127.0.0.1:2368
+    codec: lidar:vlp16
+    sensor:
+      blueprint: sensor.lidar.ray_cast
+      transform: {x: -0.49707, y: 0.0, z: 2.0, roll: 0.8597, pitch: -0.0537, yaw: -88.1561}
+      attributes:
+        channels: 16
+        range: 100
+        upper_fov: 15
+        lower_fov: -15
+        points_per_second: 300000
+        rotation_frequency: 10
+        dropoff_general_rate: 0.0
+        dropoff_zero_intensity: 0.0
+      intensity_scale: 255
+
+lifecycle:
+  startup:
+    - send: vehicle_can
+      name: PowerMode
+      fields: {Ignition: 0}
+  scenario_start:
+    # Autoware initializes localization, sets the route and engages; the run
+    # holds the ego still until it answers.
+    - wait: vehicle_can
+      name: EcuStatus
+      fields: {Ready: 1}
+      timeout: 170.0
+  scenario_end:
+    - send: vehicle_can
+      name: PowerMode
+      fields: {Ignition: 0}
+    - sleep: 1.0
+  shutdown: []
