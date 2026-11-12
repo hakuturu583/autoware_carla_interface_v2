@@ -98,6 +98,7 @@ lifecycle:
     # With the LiDAR streaming, Autoware initializes localization, sets the
     # route and engages; the run holds the ego still until it drives, and its
     # clock starts then (needs autoware_carla_scenario with the warmup phase).
+    # The run's hils.ready_timeout_s covers this and scenario_start together.
     - wait: vehicle_can
       name: EcuStatus
       fields: {Engaged: 1}
