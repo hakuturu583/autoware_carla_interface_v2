@@ -156,7 +156,7 @@ Autoware is that ECU and sees only the car's interfaces, never CARLA:
 | LiDAR | a ray-cast LiDAR where `velodyne_top` is, sent as a Hesai Pandar XT32's UDP packets to `127.0.0.1:2368` (10 Hz, 64 000 points a revolution) | nebula's Hesai driver (`pandar_points` → `/sensing/lidar/top/pointcloud_raw_ex`) |
 | Vehicle CAN (`vcan0`, `config/hils/carla_autoware.dbc`) | `VehicleStatus`, `ImuData`, `ImuRates` (100 Hz), `GnssPosition` / `GnssAttitude` (the ego's pose, as a simulated GNSS) | `hils_vehicle_interface`: `/vehicle/status/*`, the IMU, `/sensing/gnss/pose_with_covariance` |
 | | `ControlCmd` → CARLA Ackermann control (`commands.mode: ackermann`) | `/control/command/control_cmd` → `ControlCmd` (50 Hz) |
-| Lifecycle | `PowerMode.Ignition` on while a scenario runs; `scenario_start` waits for `EcuStatus.Ready` | Ready once the AD API is up; then, with the sensors streaming, initialize localization at the GNSS pose, set the route to `goal_x/y/yaw`, engage |
+| Lifecycle | `PowerMode.Ignition` on while a scenario runs; `scenario_start` waits for `EcuStatus.Ready`, `warmup` (sensors streaming) for `EcuStatus.Engaged`, and the scenario's clock starts after it | Ready once the AD API is up; then initialize localization at the GNSS pose, set the route to `goal_x/y/yaw`, engage; Engaged while in autonomous mode |
 
 Autoware runs on its own clock (`use_sim_time:=false`) and the bridge on `clock: wall`, as an ECU
 would. The ECU only learns the goal from `goal_*`; a car's ECU gets it from its operator.

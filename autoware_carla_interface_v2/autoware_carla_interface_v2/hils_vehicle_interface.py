@@ -31,10 +31,12 @@ a car:
   answers ``EcuStatus.Ready`` as soon as Autoware's AD API is up -- the
   bridge's ``scenario_start`` step waits for it, and the bridge attaches its
   sensors only after that step, so the ECU is ready before it sees any sensor
-  data, as a car's ECUs are awake before they drive. Then, with the scenario
-  live and the LiDAR streaming, it initializes localization at the GNSS pose,
-  sets the route to ``goal`` and engages. When the ignition goes off the route
-  is cleared and Autoware stopped.
+  data, as a car's ECUs are awake before they drive. Then, with the LiDAR
+  streaming, it initializes localization at the GNSS pose, sets the route to
+  ``goal`` and engages; ``EcuStatus.Engaged`` says Autoware drives (autonomous
+  mode), which the bridge's ``warmup`` step waits for before the scenario's
+  clock starts. When the ignition goes off the route is cleared and Autoware
+  stopped.
 
 Nothing here talks to CARLA: the node only sees the CAN, as the ECU would.
 """
@@ -261,7 +263,9 @@ def main(args=None):
             self._send("ControlCmd", fields)
 
         def _send_status(self):
-            engaged = bool(self.operation_mode and self.operation_mode.is_autoware_control_enabled)
+            mode = self.operation_mode
+            engaged = bool(
+                mode and mode.mode == OperationModeState.AUTONOMOUS and mode.is_autoware_control_enabled)
             self._send("EcuStatus", {"Ready": int(self.ready and self.ignition), "Engaged": int(engaged)})
             if self.ignition and time.monotonic() - self.ignition_seen > self.ignition_timeout:
                 self._set_ignition(False)
